@@ -1,0 +1,8 @@
+﻿COMIND SOON AUTOMATION
+Date: 2026-10-29T16:17:01
+Project: D:\всё\сейчас\comind_soon
+Backup: D:\всё\сейчас\comind_soon\_backup_full_20261029_161308
+Backend module: D:\всё\сейчас\comind_soon\backend\app\api\routes\extended.py
+Windows installer: D:\всё\сейчас\comind_soon\frontend\release\COMIND Setup 0.0.0.exe
+Features API: profiles, roles, community management, channels, messages, voice signaling, notifications, search, reports/moderation
+LIMITS: voice signaling does not itself transmit audio/video; platform administrator needs is_admin enabled securely by a trusted operator; Android API address and STUN/TURN need environment configuration.

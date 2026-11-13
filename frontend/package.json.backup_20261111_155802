@@ -1,0 +1,66 @@
+{
+    "name":  "frontend",
+    "private":  true,
+    "version":  "0.0.0",
+    "type":  "module",
+    "scripts":  {
+                    "dev":  "vite",
+                    "build":  "tsc -b \u0026\u0026 vite build",
+                    "lint":  "eslint .",
+                    "preview":  "vite preview",
+                    "desktop":  "npm run build \u0026\u0026 electron .",
+                    "desktop:build":  "npm run build \u0026\u0026 electron-builder",
+                    "android:sync":  "npm run build \u0026\u0026 cap sync android",
+                    "android:open":  "cap open android"
+                },
+    "dependencies":  {
+                         "@capacitor/android":  "^8.5.3",
+                         "@capacitor/core":  "^8.5.3",
+                         "react":  "^19.2.8",
+                         "react-dom":  "^19.2.8"
+                     },
+    "devDependencies":  {
+                            "@capacitor/cli":  "^8.5.3",
+                            "@eslint/js":  "^10.0.1",
+                            "@types/node":  "^24.13.3",
+                            "@types/react":  "^19.2.18",
+                            "@types/react-dom":  "^19.2.7",
+                            "@vitejs/plugin-react":  "^6.1.1",
+                            "electron":  "^44.7.0",
+                            "electron-builder":  "^26.15.3",
+                            "eslint":  "^10.10.0",
+                            "eslint-plugin-react-hooks":  "^7.1.1",
+                            "eslint-plugin-react-refresh":  "^0.5.6",
+                            "globals":  "^17.12.0",
+                            "typescript":  "~6.0.2",
+                            "typescript-eslint":  "^8.69.0",
+                            "vite":  "^8.3.0"
+                        },
+    "main":  "electron.cjs",
+    "build":  {
+                  "directories":  {
+                                      "output":  "release"
+                                  },
+                  "files":  [
+                                "dist/**/*",
+                                "electron.cjs",
+                                "package.json"
+                            ],
+                  "productName":  "COMIND",
+                  "win":  {
+                              "target":  [
+                                             {
+                                                 "target":  "nsis",
+                                                 "arch":  [
+                                                              "x64"
+                                                          ]
+                                             }
+                                         ]
+                          },
+                  "appId":  "com.comind.app",
+                  "nsis":  {
+                               "oneClick":  false,
+                               "allowToChangeInstallationDirectory":  true
+                           }
+              }
+}

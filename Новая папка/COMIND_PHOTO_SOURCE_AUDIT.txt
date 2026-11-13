@@ -1,0 +1,2600 @@
+﻿COMIND SOON — PHOTO FEATURE SOURCE AUDIT
+ROOT: E:\COMIND_SOON_FOR_REVIEW_20261105_194130
+DATE: 11/12/2026 19:45:03
+
+
+========== backend\requirements.txt ==========
+fastapi
+uvicorn[standard]
+pydantic-settings
+websockets
+
+PyJWT>=2.8,<3
+
+pwdlib[argon2]
+
+email-validator
+
+
+
+========== backend\app\main.py ==========
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.core.config import settings
+from app.core.database import init_db, init_chat_access
+
+from app.api.routes.auth import router as auth_router
+from app.api.routes.communities import router as communities_router
+from app.api.routes.channels import router as channels_router
+from app.api.routes.admin import router as admin_router
+from app.api.routes.voice import router as voice_router
+from app.api.routes.forum import router as forum_router, init_forum
+from app.api.routes.dm import router as dm_router, init_dm
+from app.api.routes.extended import router as extended_router, init_extended
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    init_chat_access()
+    init_extended()
+    init_dm()
+    init_forum()
+    yield
+
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    description="Gaming community and social platform API",
+    version=settings.APP_VERSION,
+    debug=settings.DEBUG,
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "null",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+        "capacitor://localhost",
+        "http://localhost",
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Core API
+app.include_router(auth_router)
+app.include_router(communities_router)
+app.include_router(channels_router)
+app.include_router(admin_router)
+
+# Social and platform features
+app.include_router(extended_router)
+app.include_router(dm_router)
+
+# Voice communication
+app.include_router(voice_router)
+app.include_router(forum_router)
+
+
+@app.get("/")
+def root():
+    return {
+        "message": settings.APP_NAME,
+        "status": "running",
+        "version": settings.APP_VERSION,
+    }
+
+
+@app.get("/api/health")
+def health_check():
+    return {"status": "ok", "service": "backend"}
+
+
+@app.get("/api/database/health")
+def database_health():
+    from app.core.database import get_db
+
+    with get_db() as connection:
+        connection.execute("SELECT 1").fetchone()
+
+    return {"status": "ok", "database": "sqlite"}
+
+
+
+
+
+========== backend\app\core\database.py ==========
+import sqlite3
+from pathlib import Path
+from contextlib import contextmanager
+
+DATABASE_PATH = Path(__file__).resolve().parents[2] / "comind_soon.db"
+
+
+def get_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+@contextmanager
+def get_db():
+    connection = get_connection()
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def init_db() -> None:
+    with get_db() as connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS communities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                owner_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (owner_id) REFERENCES users(id)
+            )
+        """)
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS community_members (
+                community_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                role TEXT NOT NULL DEFAULT 'member',
+                joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (community_id, user_id),
+                FOREIGN KEY (community_id) REFERENCES communities(id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+                    ON DELETE CASCADE
+            )
+        """)
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                community_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                channel_type TEXT NOT NULL DEFAULT 'text',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (community_id) REFERENCES communities(id)
+                    ON DELETE CASCADE
+            )
+        """)
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (channel_id) REFERENCES channels(id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+
+
+def init_chat_access() -> None:
+    """Р‘РµР·РѕРїР°СЃРЅР°СЏ РјРёРіСЂР°С†РёСЏ РґРѕСЃС‚СѓРїР° Рє С‡Р°С‚Р°Рј Рё Р°РґРјРёРЅРёСЃС‚СЂРёСЂРѕРІР°РЅРёСЏ."""
+    with get_db() as connection:
+        user_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(users)")
+        }
+        if "is_admin" not in user_columns:
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"
+            )
+
+        channel_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(channels)")
+        }
+        if "visibility" not in channel_columns:
+            connection.execute(
+                "ALTER TABLE channels ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'"
+            )
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS channel_members (
+                channel_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (channel_id, user_id),
+                FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+
+
+
+========== backend\app\api\routes\forum.py ==========
+import sqlite3
+
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+
+from app.core.database import get_db
+from app.api.routes.auth import current_user
+
+router = APIRouter(prefix="/api/forum", tags=["Forum"])
+
+
+DEFAULT_CATEGORIES = [
+    ("games", "Игры", "Обсуждения, обзоры и игровые впечатления"),
+    ("gaming-news", "Новости игровой индустрии", "Анонсы, события и обновления"),
+    ("technology", "Технологии", "Оборудование и программное обеспечение"),
+    ("development", "Разработка", "Создание игр и программирование"),
+    ("guides", "Гайды и помощь", "Советы и инструкции"),
+    ("community", "Сообщество", "Общение и свободные темы"),
+]
+
+
+def init_forum():
+    with get_db() as db:
+        db.executescript("""
+            CREATE TABLE IF NOT EXISTS forum_categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS forum_topics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id INTEGER NOT NULL,
+                author_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                views INTEGER NOT NULL DEFAULT 0,
+                is_pinned INTEGER NOT NULL DEFAULT 0,
+                is_locked INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(category_id)
+                    REFERENCES forum_categories(id),
+                FOREIGN KEY(author_id)
+                    REFERENCES users(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS forum_posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                topic_id INTEGER NOT NULL,
+                author_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                edited_at TEXT,
+                FOREIGN KEY(topic_id)
+                    REFERENCES forum_topics(id) ON DELETE CASCADE,
+                FOREIGN KEY(author_id)
+                    REFERENCES users(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_forum_topics_category
+            ON forum_topics(category_id, created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_forum_topics_author
+            ON forum_topics(author_id);
+
+            CREATE INDEX IF NOT EXISTS idx_forum_posts_topic
+            ON forum_posts(topic_id, id);
+
+            CREATE INDEX IF NOT EXISTS idx_forum_posts_author
+            ON forum_posts(author_id);
+        """)
+
+        for order, (slug, name, description) in enumerate(DEFAULT_CATEGORIES):
+            db.execute("""
+                INSERT OR IGNORE INTO forum_categories
+                (slug, name, description, sort_order)
+                VALUES (?, ?, ?, ?)
+            """, (slug, name, description, order))
+
+
+class TopicCreate(BaseModel):
+    category_id: int
+    title: str = Field(min_length=5, max_length=140)
+    content: str = Field(min_length=10, max_length=20000)
+
+
+class PostCreate(BaseModel):
+    content: str = Field(min_length=1, max_length=10000)
+
+
+class TopicUpdate(BaseModel):
+    title: str = Field(min_length=5, max_length=140)
+    content: str = Field(min_length=10, max_length=20000)
+
+
+class PostUpdate(BaseModel):
+    content: str = Field(min_length=1, max_length=10000)
+
+
+def get_topic(db, topic_id):
+    topic = db.execute("""
+        SELECT
+            t.*,
+            u.username AS author,
+            COALESCE(u.display_name, '') AS display_name,
+            c.name AS category,
+            c.slug AS category_slug,
+            (SELECT COUNT(*) FROM forum_posts p
+             WHERE p.topic_id=t.id) AS replies
+        FROM forum_topics t
+        JOIN users u ON u.id=t.author_id
+        JOIN forum_categories c ON c.id=t.category_id
+        WHERE t.id=?
+    """, (topic_id,)).fetchone()
+
+    return dict(topic) if topic else None
+
+
+@router.get("/categories")
+def categories(user: dict = Depends(current_user)):
+    with get_db() as db:
+        rows = db.execute("""
+            SELECT
+                c.*,
+                COUNT(t.id) AS topic_count
+            FROM forum_categories c
+            LEFT JOIN forum_topics t ON t.category_id=c.id
+            GROUP BY c.id
+            ORDER BY c.sort_order, c.id
+        """).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+@router.get("/topics")
+def topics(
+    category_id: int | None = None,
+    q: str = Query(default="", max_length=150),
+    limit: int = Query(default=30, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    user: dict = Depends(current_user),
+):
+    conditions = []
+    params = []
+
+    if category_id is not None:
+        conditions.append("t.category_id=?")
+        params.append(category_id)
+
+    if q.strip():
+        conditions.append("(t.title LIKE ? OR t.content LIKE ?)")
+        term = "%" + q.strip() + "%"
+        params.extend([term, term])
+
+    where = "WHERE " + " AND ".join(conditions) if conditions else ""
+
+    with get_db() as db:
+        rows = db.execute(f"""
+            SELECT
+                t.id,
+                t.category_id,
+                t.author_id,
+                t.title,
+                t.content,
+                t.views,
+                t.is_pinned,
+                t.is_locked,
+                t.created_at,
+                t.updated_at,
+                u.username AS author,
+                c.name AS category,
+                c.slug AS category_slug,
+                (SELECT COUNT(*) FROM forum_posts p
+                 WHERE p.topic_id=t.id) AS replies
+            FROM forum_topics t
+            JOIN users u ON u.id=t.author_id
+            JOIN forum_categories c ON c.id=t.category_id
+            {where}
+            ORDER BY t.is_pinned DESC, t.created_at DESC, t.id DESC
+            LIMIT ? OFFSET ?
+        """, (*params, limit, offset)).fetchall()
+
+        total = db.execute(f"""
+            SELECT COUNT(*) AS total
+            FROM forum_topics t
+            {where}
+        """, params).fetchone()["total"]
+
+    return {
+        "items": [dict(row) for row in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@router.post("/topics", status_code=201)
+def create_topic(
+    data: TopicCreate,
+    user: dict = Depends(current_user),
+):
+    with get_db() as db:
+        category = db.execute(
+            "SELECT id FROM forum_categories WHERE id=?",
+            (data.category_id,)
+        ).fetchone()
+
+        if category is None:
+            raise HTTPException(404, "Категория не найдена")
+
+        cursor = db.execute("""
+            INSERT INTO forum_topics
+            (category_id, author_id, title, content)
+            VALUES (?, ?, ?, ?)
+        """, (
+            data.category_id,
+            user["id"],
+            data.title.strip(),
+            data.content.strip(),
+        ))
+
+        topic = get_topic(db, cursor.lastrowid)
+
+    return topic
+
+
+@router.get("/topics/{topic_id}")
+def topic_detail(
+    topic_id: int,
+    user: dict = Depends(current_user),
+):
+    with get_db() as db:
+        db.execute(
+            "UPDATE forum_topics SET views=views+1 WHERE id=?",
+            (topic_id,)
+        )
+        topic = get_topic(db, topic_id)
+
+    if topic is None:
+        raise HTTPException(404, "Тема не найдена")
+
+    return topic
+
+
+@router.patch("/topics/{topic_id}")
+def update_topic(
+    topic_id: int,
+    data: TopicUpdate,
+    user: dict = Depends(current_user),
+):
+    with get_db() as db:
+        topic = db.execute(
+            "SELECT author_id FROM forum_topics WHERE id=?",
+            (topic_id,)
+        ).fetchone()
+
+        if topic is None:
+            raise HTTPException(404, "Тема не найдена")
+
+        if topic["author_id"] != user["id"] and not user.get("is_admin"):
+            raise HTTPException(403, "Недостаточно прав")
+
+        db.execute("""
+            UPDATE forum_topics
+            SET title=?, content=?, updated_at=CURRENT_TIMESTAMP
+            WHERE id=?
+        """, (data.title.strip(), data.content.strip(), topic_id))
+
+        result = get_topic(db, topic_id)
+
+    return result
+
+
+@router.delete("/topics/{topic_id}")
+def delete_topic(
+    topic_id: int,
+    user: dict = Depends(current_user),
+):
+    with get_db() as db:
+        topic = db.execute(
+            "SELECT author_id FROM forum_topics WHERE id=?",
+            (topic_id,)
+        ).fetchone()
+
+        if topic is None:
+            raise HTTPException(404, "Тема не найдена")
+
+        if topic["author_id"] != user["id"] and not user.get("is_admin"):
+            raise HTTPException(403, "Недостаточно прав")
+
+        db.execute("DELETE FROM forum_topics WHERE id=?", (topic_id,))
+
+    return {"status": "deleted", "topic_id": topic_id}
+
+
+@router.get("/topics/{topic_id}/posts")
+def get_posts(
+    topic_id: int,
+    limit: int = Query(default=100, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    user: dict = Depends(current_user),
+):
+    with get_db() as db:
+        topic = db.execute(
+            "SELECT id FROM forum_topics WHERE id=?",
+            (topic_id,)
+        ).fetchone()
+
+        if topic is None:
+            raise HTTPException(404, "Тема не найдена")
+
+        rows = db.execute("""
+            SELECT
+                p.id,
+                p.topic_id,
+                p.author_id,
+                p.content,
+                p.created_at,
+                p.edited_at,
+                u.username AS author,
+                COALESCE(u.display_name, '') AS display_name
+            FROM forum_posts p
+            JOIN users u ON u.id=p.author_id
+            WHERE p.topic_id=?
+            ORDER BY p.id ASC
+            LIMIT ? OFFSET ?
+        """, (topic_id, limit, offset)).fetchall()
+
+        total = db.execute(
+            "SELECT COUNT(*) AS total FROM forum_posts WHERE topic_id=?",
+            (topic_id,)
+        ).fetchone()["total"]
+
+    return {
+        "items": [dict(row) for row in rows],
+        "total": total,
+    }
+
+
+@router.post("/topics/{topic_id}/posts", status_code=201)
+def create_post(
+    topic_id: int,
+    data: PostCreate,
+    user: dict = Depends(current_user),
+):
+    with get_db() as db:
+        topic = db.execute(
+            "SELECT id, is_locked FROM forum_topics WHERE id=?",
+            (topic_id,)
+        ).fetchone()
+
+        if topic is None:
+            raise HTTPException(404, "Тема не найдена")
+
+        if topic["is_locked"]:
+            raise HTTPException(403, "Тема закрыта для ответов")
+
+        cursor = db.execute("""
+            INSERT INTO forum_posts (topic_id, author_id, content)
+            VALUES (?, ?, ?)
+        """, (topic_id, user["id"], data.content.strip()))
+
+        db.execute(
+            "UPDATE forum_topics SET updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (topic_id,)
+        )
+
+        post = db.execute("""
+            SELECT
+                p.*,
+                u.username AS author,
+                COALESCE(u.display_name, '') AS display_name
+            FROM forum_posts p
+            JOIN users u ON u.id=p.author_id
+            WHERE p.id=?
+        """, (cursor.lastrowid,)).fetchone()
+
+    return dict(post)
+
+
+@router.patch("/posts/{post_id}")
+def update_post(
+    post_id: int,
+    data: PostUpdate,
+    user: dict = Depends(current_user),
+):
+    with get_db() as db:
+        post = db.execute(
+            "SELECT author_id FROM forum_posts WHERE id=?",
+            (post_id,)
+        ).fetchone()
+
+        if post is None:
+            raise HTTPException(404, "Ответ не найден")
+
+        if post["author_id"] != user["id"] and not user.get("is_admin"):
+            raise HTTPException(403, "Недостаточно прав")
+
+        db.execute("""
+            UPDATE forum_posts
+            SET content=?, edited_at=CURRENT_TIMESTAMP
+            WHERE id=?
+        """, (data.content.strip(), post_id))
+
+        result = db.execute("""
+            SELECT p.*, u.username AS author,
+                   COALESCE(u.display_name, '') AS display_name
+            FROM forum_posts p
+            JOIN users u ON u.id=p.author_id
+            WHERE p.id=?
+        """, (post_id,)).fetchone()
+
+    return dict(result)
+
+
+@router.delete("/posts/{post_id}")
+def delete_post(
+    post_id: int,
+    user: dict = Depends(current_user),
+):
+    with get_db() as db:
+        post = db.execute(
+            "SELECT author_id, topic_id FROM forum_posts WHERE id=?",
+            (post_id,)
+        ).fetchone()
+
+        if post is None:
+            raise HTTPException(404, "Ответ не найден")
+
+        if post["author_id"] != user["id"] and not user.get("is_admin"):
+            raise HTTPException(403, "Недостаточно прав")
+
+        db.execute("DELETE FROM forum_posts WHERE id=?", (post_id,))
+        topic_id = post["topic_id"]
+
+    return {"status": "deleted", "post_id": post_id, "topic_id": topic_id}
+
+
+
+========== backend\app\api\routes\auth.py ==========
+import sqlite3
+
+import jwt
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+from app.core.database import get_db
+from app.core.security import (
+    create_access_token,
+    decode_access_token,
+    hash_password,
+    verify_password,
+)
+from app.schemas.auth import (
+    LoginRequest,
+    RegisterRequest,
+    TokenResponse,
+    UserResponse,
+)
+
+router = APIRouter(prefix="/api/auth", tags=["Authentication"])
+bearer = HTTPBearer(auto_error=False)
+
+
+def current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+):
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="РўСЂРµР±СѓРµС‚СЃСЏ Р°РІС‚РѕСЂРёР·Р°С†РёСЏ",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        payload = decode_access_token(credentials.credentials)
+        user_id = int(payload["sub"])
+    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="РќРµРґРµР№СЃС‚РІРёС‚РµР»СЊРЅС‹Р№ РёР»Рё РїСЂРѕСЃСЂРѕС‡РµРЅРЅС‹Р№ С‚РѕРєРµРЅ",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    with get_db() as connection:
+        user = connection.execute(
+            "SELECT id, username, email, created_at, COALESCE(is_admin, 0) AS is_admin FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+
+    if user is None:
+        raise HTTPException(status_code=401, detail="РџРѕР»СЊР·РѕРІР°С‚РµР»СЊ РЅРµ РЅР°Р№РґРµРЅ")
+
+    return dict(user)
+
+
+@router.post("/register", response_model=UserResponse, status_code=201)
+def register(data: RegisterRequest):
+    with get_db() as connection:
+        try:
+            cursor = connection.execute(
+                """
+                INSERT INTO users (username, email, password_hash)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    data.username,
+                    str(data.email).lower(),
+                    hash_password(data.password),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            raise HTTPException(
+                status_code=409,
+                detail="РРјСЏ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ РёР»Рё email СѓР¶Рµ Р·Р°РЅСЏС‚С‹",
+            )
+
+        user = connection.execute(
+            "SELECT id, username, email, created_at, COALESCE(is_admin, 0) AS is_admin FROM users WHERE id = ?",
+            (cursor.lastrowid,),
+        ).fetchone()
+
+    return dict(user)
+
+
+@router.post("/login", response_model=TokenResponse)
+def login(data: LoginRequest):
+    with get_db() as connection:
+        user = connection.execute(
+            "SELECT id, email, password_hash FROM users WHERE email = ?",
+            (str(data.email).lower(),),
+        ).fetchone()
+
+    if user is None or not verify_password(data.password, user["password_hash"]):
+        raise HTTPException(
+            status_code=401,
+            detail="РќРµРІРµСЂРЅС‹Р№ email РёР»Рё РїР°СЂРѕР»СЊ",
+        )
+
+    return {
+        "access_token": create_access_token(user["id"]),
+        "token_type": "bearer",
+    }
+
+
+@router.get("/me", response_model=UserResponse)
+def me(user: dict = Depends(current_user)):
+    return user
+
+
+
+========== frontend\package.json ==========
+{
+    "name":  "frontend",
+    "private":  true,
+    "version":  "0.0.0",
+    "type":  "module",
+    "scripts":  {
+                    "dev":  "vite",
+                    "build":  "tsc -b \u0026\u0026 vite build",
+                    "lint":  "eslint .",
+                    "preview":  "vite preview",
+                    "desktop":  "npm run build \u0026\u0026 electron .",
+                    "desktop:build":  "npm run build \u0026\u0026 electron-builder",
+                    "android:sync":  "npm run build \u0026\u0026 cap sync android",
+                    "android:open":  "cap open android"
+                },
+    "dependencies":  {
+                         "@capacitor/android":  "^8.5.3",
+                         "@capacitor/core":  "^8.5.3",
+                         "react":  "^19.2.8",
+                         "react-dom":  "^19.2.8"
+                     },
+    "devDependencies":  {
+                            "@capacitor/cli":  "^8.5.3",
+                            "@eslint/js":  "^10.0.1",
+                            "@types/node":  "^24.13.3",
+                            "@types/react":  "^19.2.18",
+                            "@types/react-dom":  "^19.2.7",
+                            "@vitejs/plugin-react":  "^6.1.1",
+                            "electron":  "^44.7.0",
+                            "electron-builder":  "^26.15.3",
+                            "eslint":  "^10.10.0",
+                            "eslint-plugin-react-hooks":  "^7.1.1",
+                            "eslint-plugin-react-refresh":  "^0.5.6",
+                            "globals":  "^17.12.0",
+                            "typescript":  "~6.0.2",
+                            "typescript-eslint":  "^8.69.0",
+                            "vite":  "^8.3.0"
+                        },
+    "main":  "electron.cjs",
+    "build":  {
+                  "directories":  {
+                                      "output":  "release"
+                                  },
+                  "files":  [
+                                "dist/**/*",
+                                "electron.cjs",
+                                "package.json"
+                            ],
+                  "productName":  "COMIND",
+                  "win":  {
+                              "target":  [
+                                             {
+                                                 "target":  "nsis",
+                                                 "arch":  [
+                                                              "x64"
+                                                          ]
+                                             }
+                                         ]
+                          },
+                  "appId":  "com.comind.app",
+                  "nsis":  {
+                               "oneClick":  false,
+                               "allowToChangeInstallationDirectory":  true
+                           }
+              }
+}
+
+
+
+========== frontend\src\api.ts ==========
+const API_URL = (
+  import.meta.env.VITE_API_URL || "http://127.0.0.1:8000"
+).replace(/\/+$/, "");
+
+
+export type ForumCategory = {
+  id: number;
+  slug: string;
+  name: string;
+  description: string;
+  topic_count: number;
+};
+
+export type ForumTopic = {
+  id: number;
+  category_id: number;
+  author_id: number;
+  title: string;
+  content: string;
+  author: string;
+  category: string;
+  category_slug: string;
+  views: number;
+  replies: number;
+  is_pinned: number;
+  is_locked: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ForumPost = {
+  id: number;
+  topic_id: number;
+  author_id: number;
+  content: string;
+  author: string;
+  display_name: string;
+  created_at: string;
+  edited_at: string | null;
+};
+export type ApiRecord = {
+  id: number;
+  [key: string]: unknown;
+};
+
+export type Community = ApiRecord & {
+  name: string;
+  description?: string | null;
+  member_count?: number;
+};
+
+export type Channel = ApiRecord & {
+  name: string;
+  channel_type?: string;
+  community_id?: number;
+};
+
+export type Message = ApiRecord & {
+  content: string;
+  user_id?: number;
+  username?: string;
+  created_at?: string;
+  edited_at?: string | null;
+};
+
+export type Profile = {
+  id: number;
+  username: string;
+  email: string;
+  display_name: string;
+  avatar_url: string;
+  bio: string;
+  status: "online" | "away" | "busy" | "offline";
+  created_at?: string;
+};
+
+export type CommunityMember = {
+  user_id: number;
+  username: string;
+  display_name: string;
+  avatar_url: string;
+  status: string;
+  role: "owner" | "admin" | "moderator" | "member";
+  joined_at?: string;
+};
+
+export type Notification = {
+  id: number;
+  title: string;
+  body: string;
+  is_read: number;
+  created_at: string;
+};
+
+export type SearchResults = {
+  communities: Community[];
+  users: Array<{
+    id: number;
+    username: string;
+    display_name: string;
+    avatar_url: string;
+  }>;
+  messages: Message[];
+};
+
+export type Report = {
+  id: number;
+  reporter_id: number;
+  target_user_id: number | null;
+  message_id: number | null;
+  reason: string;
+  status: string;
+  resolution?: string;
+  created_at: string;
+};
+
+async function request<T>(
+  path: string,
+  options: RequestInit = {},
+): Promise<T> {
+  const headers = new Headers(options.headers);
+  headers.set("Accept", "application/json");
+
+  if (options.body !== undefined && options.body !== null) {
+    headers.set("Content-Type", "application/json");
+  }
+
+  const token = localStorage.getItem("comind_access_token");
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+
+  let response: Response;
+
+  try {
+    response = await fetch(`${API_URL}${path}`, {
+      ...options,
+      headers,
+    });
+  } catch {
+    throw new Error(
+      `Не удалось подключиться к COMIND API (${API_URL}). Проверь backend.`,
+    );
+  }
+
+  if (response.status === 204) return undefined as T;
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const detail = (data as { detail?: unknown })?.detail;
+    const message = Array.isArray(detail)
+      ? detail.map((item: { msg?: string }) => item.msg || "").filter(Boolean).join("; ")
+      : typeof detail === "string"
+        ? detail
+        : `Ошибка HTTP ${response.status}`;
+
+    if (response.status === 401) {
+      throw new Error("Сессия истекла. Войди в аккаунт заново.");
+    }
+
+    throw new Error(message);
+  }
+
+  return data as T;
+}
+
+function list<T>(value: unknown, label: string): T[] {
+  if (Array.isArray(value)) return value as T[];
+
+  if (value && typeof value === "object") {
+    const obj = value as { items?: unknown; results?: unknown };
+    if (Array.isArray(obj.items)) return obj.items as T[];
+    if (Array.isArray(obj.results)) return obj.results as T[];
+  }
+
+  throw new Error(`Неожиданный формат ответа API: ${label}`);
+}
+
+function body(data: unknown): string {
+  return JSON.stringify(data);
+}
+
+export const api = {
+  // Сообщества
+  async getCommunities(): Promise<Community[]> {
+    return list(await request("/api/communities/"), "communities");
+  },
+
+  getCommunity(id: number): Promise<Community> {
+    return request(`/api/communities/${id}`);
+  },
+
+  createCommunity(data: { name: string; description: string }): Promise<Community> {
+    return request("/api/communities/", {
+      method: "POST",
+      body: body(data),
+    });
+  },
+
+  joinCommunity(id: number) {
+    return request<{ status: string; community_id: number }>(
+      `/api/communities/${id}/join`,
+      { method: "POST" },
+    );
+  },
+
+  updateCommunity(id: number, data: { name: string; description: string }) {
+    return request<Community>(`/api/communities/${id}`, {
+      method: "PATCH",
+      body: body(data),
+    });
+  },
+
+  deleteCommunity(id: number) {
+    return request<{ status: string; community_id: number }>(
+      `/api/communities/${id}`,
+      { method: "DELETE" },
+    );
+  },
+
+  async getMembers(id: number): Promise<CommunityMember[]> {
+    return list(await request(`/api/communities/${id}/members`), "members");
+  },
+
+  setMemberRole(
+    communityId: number,
+    userId: number,
+    role: "admin" | "moderator" | "member",
+  ) {
+    return request(`/api/communities/${communityId}/members/${userId}`, {
+      method: "PATCH",
+      body: body({ role }),
+    });
+  },
+
+  // Текстовые и голосовые каналы
+  async getChannels(communityId: number): Promise<Channel[]> {
+    return list(
+      await request(`/api/communities/${communityId}/channels`),
+      "channels",
+    );
+  },
+
+  createChannel(communityId: number, name: string): Promise<Channel> {
+    return request(`/api/communities/${communityId}/channels`, {
+      method: "POST",
+      body: body({ name }),
+    });
+  },
+
+  createVoiceChannel(communityId: number, name: string): Promise<Channel> {
+    return request(`/api/communities/${communityId}/voice-channels`, {
+      method: "POST",
+      body: body({ name }),
+    });
+  },
+
+  renameChannel(id: number, name: string) {
+    return request(`/api/channels/${id}`, {
+      method: "PATCH",
+      body: body({ name }),
+    });
+  },
+
+  deleteChannel(id: number) {
+    return request(`/api/channels/${id}`, { method: "DELETE" });
+  },
+
+  // Сообщения
+  async getMessages(channelId: number, limit = 50): Promise<Message[]> {
+    return list(
+      await request(`/api/channels/${channelId}/messages?limit=${limit}`),
+      "messages",
+    );
+  },
+
+  sendMessage(channelId: number, content: string): Promise<Message> {
+    return request(`/api/channels/${channelId}/messages`, {
+      method: "POST",
+      body: body({ content }),
+    });
+  },
+
+  editMessage(id: number, content: string) {
+    return request(`/api/messages/${id}`, {
+      method: "PATCH",
+      body: body({ content }),
+    });
+  },
+
+  deleteMessage(id: number) {
+    return request(`/api/messages/${id}`, { method: "DELETE" });
+  },
+
+  // Профиль пользователя
+  getProfile(): Promise<Profile> {
+    return request("/api/profile/me");
+  },
+
+  updateProfile(data: Partial<Pick<
+    Profile,
+    "display_name" | "bio" | "avatar_url" | "status"
+  >>) {
+    return request<Profile>("/api/profile/me", {
+      method: "PATCH",
+      body: body(data),
+    });
+  },
+
+  // Поиск
+  search(query: string): Promise<SearchResults> {
+    return request(`/api/search?q=${encodeURIComponent(query)}`);
+  },
+
+  // Уведомления
+  getNotifications(limit = 50) {
+    return request<{ items: Notification[]; unread: number }>(
+      `/api/notifications?limit=${limit}`,
+    );
+  },
+
+  readNotification(id: number) {
+    return request(`/api/notifications/${id}/read`, { method: "POST" });
+  },
+
+  readAllNotifications() {
+    return request("/api/notifications/read-all", { method: "POST" });
+  },
+
+  // Жалобы и модерация
+  createReport(data: {
+    target_user_id?: number;
+    message_id?: number;
+    reason: string;
+  }) {
+    return request<Report>("/api/reports", {
+      method: "POST",
+      body: body(data),
+    });
+  },
+
+  getReports() {
+    return request<Report[]>("/api/moderation/reports");
+  },
+
+  resolveReport(
+    id: number,
+    status: "resolved" | "rejected",
+    resolution: string,
+  ) {
+    return request(`/api/moderation/reports/${id}/resolve`, {
+      method: "POST",
+      body: body({ status, resolution }),
+    });
+  },
+
+  blockUser(userId: number, reason = "", communityId?: number) {
+    const query = communityId === undefined
+      ? ""
+      : `?community_id=${communityId}`;
+
+    return request(`/api/moderation/users/${userId}/block${query}`, {
+      method: "POST",
+      body: body({ reason }),
+    });
+  },
+
+  getModerationLog(communityId?: number) {
+    const query = communityId === undefined
+      ? ""
+      : `?community_id=${communityId}`;
+
+    return request(`/api/moderation/log${query}`);
+  },
+
+  // Голосовые комнаты: управление участием и сигналами
+  joinVoice(channelId: number) {
+    return request(`/api/voice/${channelId}/join`, { method: "POST" });
+  },
+
+  leaveVoice(channelId: number) {
+    return request(`/api/voice/${channelId}/leave`, { method: "POST" });
+  },
+
+  getVoicePresence(channelId: number) {
+    return request(`/api/voice/${channelId}/presence`);
+  },
+
+  muteVoice(channelId: number, muted: boolean) {
+    return request(`/api/voice/${channelId}/mute`, {
+      method: "PATCH",
+      body: body({ muted }),
+    });
+  },
+
+  sendVoiceSignal(
+    channelId: number,
+    receiverId: number,
+    signal: Record<string, unknown>,
+  ) {
+    return request(`/api/voice/${channelId}/signal`, {
+      method: "POST",
+      body: body({
+        receiver_id: receiverId,
+        payload: JSON.stringify(signal),
+      }),
+    });
+  },
+
+  getVoiceSignals(channelId: number) {
+    return request<Array<{
+      id: number;
+      sender_id: number;
+      receiver_id: number;
+      payload: string;
+    }>>(`/api/voice/${channelId}/signals`);
+  },
+
+  // Форум COMIND SOON
+  async getForumCategories(): Promise<ForumCategory[]> {
+    return list(await request("/api/forum/categories"), "forum categories");
+  },
+
+  async getForumTopics(options: {
+    category_id?: number;
+    q?: string;
+    limit?: number;
+    offset?: number;
+  } = {}): Promise<{
+    items: ForumTopic[];
+    total: number;
+    limit: number;
+    offset: number;
+  }> {
+    const params = new URLSearchParams();
+
+    if (options.category_id !== undefined)
+      params.set("category_id", String(options.category_id));
+
+    if (options.q) params.set("q", options.q);
+    if (options.limit) params.set("limit", String(options.limit));
+    if (options.offset) params.set("offset", String(options.offset));
+
+    return request(`/api/forum/topics?${params.toString()}`);
+  },
+
+  getForumTopic(id: number): Promise<ForumTopic> {
+    return request(`/api/forum/topics/${id}`);
+  },
+
+  createForumTopic(data: {
+    category_id: number;
+    title: string;
+    content: string;
+  }): Promise<ForumTopic> {
+    return request("/api/forum/topics", {
+      method: "POST",
+      body: body(data),
+    });
+  },
+
+  updateForumTopic(id: number, data: {
+    title: string;
+    content: string;
+  }): Promise<ForumTopic> {
+    return request(`/api/forum/topics/${id}`, {
+      method: "PATCH",
+      body: body(data),
+    });
+  },
+
+  deleteForumTopic(id: number) {
+    return request(`/api/forum/topics/${id}`, { method: "DELETE" });
+  },
+
+  async getForumPosts(id: number): Promise<{
+    items: ForumPost[];
+    total: number;
+  }> {
+    return request(`/api/forum/topics/${id}/posts`);
+  },
+
+  createForumPost(id: number, content: string): Promise<ForumPost> {
+    return request(`/api/forum/topics/${id}/posts`, {
+      method: "POST",
+      body: body({ content }),
+    });
+  },
+
+  updateForumPost(id: number, content: string): Promise<ForumPost> {
+    return request(`/api/forum/posts/${id}`, {
+      method: "PATCH",
+      body: body({ content }),
+    });
+  },
+
+  deleteForumPost(id: number) {
+    return request(`/api/forum/posts/${id}`, { method: "DELETE" });
+  },
+  // Проверка backend
+  health() {
+    return request<{ status: string; service?: string }>("/api/health");
+  },
+
+  featureHealth() {
+    return request<{
+      status: string;
+      features: string[];
+      voice_media: string;
+    }>("/api/health/features");
+  },
+};
+
+export { API_URL };
+
+
+
+
+========== frontend\src\ForumShell.tsx ==========
+import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { api, type ForumCategory, type ForumTopic, type ForumPost, type Profile, type SearchResults } from "./api";
+import "./ForumShell.css";
+
+type Page = "home" | "forum" | "news" | "articles" | "users" | "profile";
+
+type Props = {
+  page: Page;
+  username: string;
+  userId: number;
+  userIsAdmin: boolean;
+};
+
+function formatDate(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString("ru-RU", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+export default function ForumShell({
+  page,
+  userId,
+  userIsAdmin,
+}: Props) {
+  const [categories, setCategories] = useState<ForumCategory[]>([]);
+  const [topics, setTopics] = useState<ForumTopic[]>([]);
+  const [totalTopics, setTotalTopics] = useState(0);
+  const [query, setQuery] = useState("");
+  const [selectedCategory, setSelectedCategory] = useState<number | null>(null);
+  const [selectedTopic, setSelectedTopic] = useState<ForumTopic | null>(null);
+  const [posts, setPosts] = useState<ForumPost[]>([]);
+  const [creating, setCreating] = useState(false);
+  const [editingTopic, setEditingTopic] = useState(false);
+  const [editingPostId, setEditingPostId] = useState<number | null>(null);
+  const [newTitle, setNewTitle] = useState("");
+  const [newCategory, setNewCategory] = useState<number | "">("");
+  const [newText, setNewText] = useState("");
+  const [replyText, setReplyText] = useState("");
+  const [editTitle, setEditTitle] = useState("");
+  const [editContent, setEditContent] = useState("");
+  const [editPostContent, setEditPostContent] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  const [profile, setProfile] = useState<Profile | null>(null);
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [profileSaving, setProfileSaving] = useState(false);
+
+  const [userQuery, setUserQuery] = useState("");
+  const [foundUsers, setFoundUsers] = useState<SearchResults["users"]>([]);
+  const [usersSearched, setUsersSearched] = useState(false);
+  const [searchLoading, setSearchLoading] = useState(false);
+
+  async function loadCategories() {
+    try {
+      const result = await api.getForumCategories();
+      setCategories(result);
+      setNewCategory((current) => current === "" ? (result[0]?.id ?? "") : current);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РіСЂСѓР·РёС‚СЊ РєР°С‚РµРіРѕСЂРёРё");
+    }
+  }
+
+  async function loadTopics() {
+    setLoading(true);
+    setError("");
+    try {
+      const pageCategorySlug =
+        page === "news" ? "gaming-news" :
+        page === "articles" ? "guides" :
+        null;
+
+      const pageCategory = pageCategorySlug
+        ? categories.find((item) => item.slug === pageCategorySlug)
+        : null;
+
+      if (pageCategorySlug && !pageCategory) {
+        setTopics([]);
+        setTotalTopics(0);
+        return;
+      }
+
+      const result = await api.getForumTopics({
+        category_id: pageCategorySlug ? pageCategory!.id : selectedCategory ?? undefined,
+        q: query.trim() || undefined,
+        limit: 100,
+        offset: 0,
+      });
+      setTopics(result.items);
+      setTotalTopics(result.total);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РіСЂСѓР·РёС‚СЊ С‚РµРјС‹");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function openTopic(topicId: number) {
+    setLoading(true);
+    setError("");
+    setCreating(false);
+    setEditingTopic(false);
+    try {
+      const [topic, result] = await Promise.all([
+        api.getForumTopic(topicId),
+        api.getForumPosts(topicId),
+      ]);
+      setSelectedTopic(topic);
+      setPosts(result.items);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "РќРµ СѓРґР°Р»РѕСЃСЊ РѕС‚РєСЂС‹С‚СЊ С‚РµРјСѓ");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    void loadCategories();
+  }, []);
+
+  useEffect(() => {
+    if (!selectedTopic && !creating) void loadTopics();
+  }, [selectedCategory, query, selectedTopic, creating, page, categories]);
+
+  useEffect(() => {
+    if (page !== "profile") return;
+
+    let active = true;
+    setProfileLoading(true);
+    setError("");
+
+    api.getProfile()
+      .then((result) => {
+        if (active) setProfile(result);
+      })
+      .catch((err) => {
+        if (active) {
+          setError(err instanceof Error ? err.message : "РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РіСЂСѓР·РёС‚СЊ РїСЂРѕС„РёР»СЊ");
+        }
+      })
+      .finally(() => {
+        if (active) setProfileLoading(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [page]);
+
+  const selectedCategoryName = useMemo(
+    () => categories.find((item) => item.id === selectedCategory)?.name ?? "Р’СЃРµ РєР°С‚РµРіРѕСЂРёРё",
+    [categories, selectedCategory],
+  );
+
+  const heading: Record<Page, string> = {
+    home: "Р“Р»Р°РІРЅР°СЏ",
+    forum: "Р¤РѕСЂСѓРј",
+    news: "РќРѕРІРѕСЃС‚Рё",
+    articles: "РЎС‚Р°С‚СЊРё",
+    users: "РџРѕР»СЊР·РѕРІР°С‚РµР»Рё",
+    profile: "РњРѕР№ РїСЂРѕС„РёР»СЊ",
+  };
+
+  const canManageTopic = Boolean(
+    selectedTopic && (selectedTopic.author_id === userId || userIsAdmin),
+  );
+
+  function startEditTopic() {
+    if (!selectedTopic) return;
+    setEditTitle(selectedTopic.title);
+    setEditContent(selectedTopic.content);
+    setEditingTopic(true);
+  }
+
+  async function createTopic(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    const requiredSlug =
+      page === "news" ? "gaming-news" :
+      page === "articles" ? "guides" :
+      null;
+
+    const requiredCategory = requiredSlug
+      ? categories.find((item) => item.slug === requiredSlug)
+      : null;
+
+    if (requiredSlug && !requiredCategory) {
+      setError("РќРµ РЅР°Р№РґРµРЅР° РєР°С‚РµРіРѕСЂРёСЏ РґР»СЏ СЌС‚РѕРіРѕ СЂР°Р·РґРµР»Р°. РћР±РЅРѕРІРёС‚Рµ СЃРїРёСЃРѕРє РєР°С‚РµРіРѕСЂРёР№.");
+      return;
+    }
+
+    const categoryId = requiredCategory?.id ?? newCategory;
+
+    if (!newTitle.trim() || !newText.trim() || categoryId === "") return;
+
+    setSaving(true);
+    setError("");
+    try {
+      const topic = await api.createForumTopic({
+        category_id: Number(categoryId),
+        title: newTitle.trim(),
+        content: newText.trim(),
+      });
+      setNewTitle("");
+      setNewText("");
+      setCreating(false);
+      setSelectedCategory(null);
+      await openTopic(topic.id);
+      await loadTopics();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "РќРµ СѓРґР°Р»РѕСЃСЊ СЃРѕР·РґР°С‚СЊ С‚РµРјСѓ");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function saveTopic(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedTopic) return;
+
+    setSaving(true);
+    setError("");
+    try {
+      const updated = await api.updateForumTopic(selectedTopic.id, {
+        title: editTitle.trim(),
+        content: editContent.trim(),
+      });
+      setSelectedTopic(updated);
+      setEditingTopic(false);
+      await loadTopics();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "РќРµ СѓРґР°Р»РѕСЃСЊ РёР·РјРµРЅРёС‚СЊ С‚РµРјСѓ");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deleteTopic() {
+    if (!selectedTopic || !window.confirm("РЈРґР°Р»РёС‚СЊ СЌС‚Сѓ С‚РµРјСѓ Рё РІСЃРµ РµС‘ РѕС‚РІРµС‚С‹?")) return;
+
+    setSaving(true);
+    setError("");
+    try {
+      await api.deleteForumTopic(selectedTopic.id);
+      setSelectedTopic(null);
+      setPosts([]);
+      await loadTopics();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "РќРµ СѓРґР°Р»РѕСЃСЊ СѓРґР°Р»РёС‚СЊ С‚РµРјСѓ");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function createPost(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!selectedTopic || !replyText.trim()) return;
+
+    setSaving(true);
+    setError("");
+    try {
+      await api.createForumPost(selectedTopic.id, replyText.trim());
+      setReplyText("");
+      const result = await api.getForumPosts(selectedTopic.id);
+      setPosts(result.items);
+      const updatedTopic = await api.getForumTopic(selectedTopic.id);
+      setSelectedTopic(updatedTopic);
+      await loadTopics();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "РќРµ СѓРґР°Р»РѕСЃСЊ РѕС‚РїСЂР°РІРёС‚СЊ РѕС‚РІРµС‚");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function savePost(postId: number) {
+    if (!editPostContent.trim()) return;
+
+    setSaving(true);
+    setError("");
+    try {
+      await api.updateForumPost(postId, editPostContent.trim());
+      setEditingPostId(null);
+      const result = await api.getForumPosts(selectedTopic!.id);
+      setPosts(result.items);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "РќРµ СѓРґР°Р»РѕСЃСЊ РёР·РјРµРЅРёС‚СЊ РѕС‚РІРµС‚");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function deletePost(postId: number) {
+    if (!window.confirm("РЈРґР°Р»РёС‚СЊ СЌС‚РѕС‚ РѕС‚РІРµС‚?")) return;
+
+    setSaving(true);
+    setError("");
+    try {
+      await api.deleteForumPost(postId);
+      const result = await api.getForumPosts(selectedTopic!.id);
+      setPosts(result.items);
+      const updatedTopic = await api.getForumTopic(selectedTopic!.id);
+      setSelectedTopic(updatedTopic);
+      await loadTopics();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "РќРµ СѓРґР°Р»РѕСЃСЊ СѓРґР°Р»РёС‚СЊ РѕС‚РІРµС‚");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function searchUsers(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    const normalizedQuery = userQuery.trim();
+
+    if (!normalizedQuery) {
+      setFoundUsers([]);
+      setUsersSearched(false);
+      setError("");
+      return;
+    }
+
+    if (normalizedQuery.length < 2) {
+      setFoundUsers([]);
+      setUsersSearched(false);
+      setError("Р’РІРµРґРёС‚Рµ РјРёРЅРёРјСѓРј 2 СЃРёРјРІРѕР»Р° РґР»СЏ РїРѕРёСЃРєР°.");
+      return;
+    }
+
+    setSearchLoading(true);
+    setError("");
+
+    try {
+      const result = await api.search(normalizedQuery);
+      setFoundUsers(result.users ?? []);
+      setUsersSearched(true);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "РќРµ СѓРґР°Р»РѕСЃСЊ РІС‹РїРѕР»РЅРёС‚СЊ РїРѕРёСЃРє");
+    } finally {
+      setSearchLoading(false);
+    }
+  }
+
+  async function saveProfile(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!profile) return;
+
+    setProfileSaving(true);
+    setError("");
+
+    try {
+      const updated = await api.updateProfile({
+        display_name: profile.display_name,
+        bio: profile.bio,
+        avatar_url: profile.avatar_url,
+        status: profile.status,
+      });
+
+      setProfile(updated);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "РќРµ СѓРґР°Р»РѕСЃСЊ СЃРѕС…СЂР°РЅРёС‚СЊ РїСЂРѕС„РёР»СЊ");
+    } finally {
+      setProfileSaving(false);
+    }
+  }
+
+  return (
+    <main className="forum-shell">
+      <div className="forum-content">
+        <div className="forum-breadcrumb">
+          <span>COMIND SOON</span>
+          <span>/</span>
+          <span>{heading[page]}</span>
+          {selectedTopic && <><span>/</span><span>{selectedTopic.title}</span></>}
+        </div>
+
+        {error && (
+          <div className="forum-error">
+            <span>{error}</span>
+            <button onClick={() => setError("")}>Р—Р°РєСЂС‹С‚СЊ</button>
+          </div>
+        )}
+
+        {selectedTopic ? (
+          <section className="topic-detail">
+            <button className="forum-back" onClick={() => {
+              setSelectedTopic(null);
+              setEditingTopic(false);
+              setEditingPostId(null);
+            }}>в†ђ РќР°Р·Р°Рґ Рє С‚РµРјР°Рј</button>
+
+            <div className="forum-kicker">
+              {selectedTopic.category} В· {selectedTopic.is_locked ? "РўРµРјР° Р·Р°РєСЂС‹С‚Р°" : "РћР±СЃСѓР¶РґРµРЅРёРµ"}
+            </div>
+
+            {editingTopic ? (
+              <form className="forum-edit-form" onSubmit={saveTopic}>
+                <label>Р—Р°РіРѕР»РѕРІРѕРє
+                  <input value={editTitle} onChange={(e) => setEditTitle(e.target.value)} minLength={5} maxLength={140} required />
+                </label>
+                <label>РўРµРєСЃС‚ РїСѓР±Р»РёРєР°С†РёРё
+                  <textarea value={editContent} onChange={(e) => setEditContent(e.target.value)} minLength={10} maxLength={20000} rows={8} required />
+                </label>
+                <div className="create-actions">
+                  <button type="button" className="forum-secondary" onClick={() => setEditingTopic(false)}>РћС‚РјРµРЅР°</button>
+                  <button type="submit" className="forum-primary" disabled={saving}>РЎРѕС…СЂР°РЅРёС‚СЊ</button>
+                </div>
+              </form>
+            ) : (
+              <>
+                <h1>{selectedTopic.title}</h1>
+                <div className="topic-author">
+                  <div className="forum-avatar">{selectedTopic.author.slice(0, 1).toUpperCase()}</div>
+                  <div>
+                    <strong>{selectedTopic.author}</strong>
+                    <small>{formatDate(selectedTopic.created_at)}</small>
+                  </div>
+                </div>
+                <article className="topic-post">
+                  {selectedTopic.content.split("\n").map((line, index) => (
+                    <p key={index}>{line || "\u00a0"}</p>
+                  ))}
+                </article>
+                {canManageTopic && (
+                  <div className="forum-manage-actions">
+                    <button className="forum-secondary" onClick={startEditTopic}>Р РµРґР°РєС‚РёСЂРѕРІР°С‚СЊ С‚РµРјСѓ</button>
+                    <button className="forum-danger" onClick={deleteTopic} disabled={saving}>РЈРґР°Р»РёС‚СЊ С‚РµРјСѓ</button>
+                  </div>
+                )}
+              </>
+            )}
+
+            <div className="topic-actions">
+              <span>в—Њ {selectedTopic.views} РїСЂРѕСЃРјРѕС‚СЂРѕРІ</span>
+              <span>в–¤ {selectedTopic.replies} РѕС‚РІРµС‚РѕРІ</span>
+            </div>
+
+            <div className="forum-section-title">
+              <h2>РћР±СЃСѓР¶РґРµРЅРёРµ</h2>
+              <span>{posts.length} РѕС‚РІРµС‚РѕРІ</span>
+            </div>
+
+            <div className="forum-post-list">
+              {posts.map((post) => {
+                const canManagePost = post.author_id === userId || userIsAdmin;
+                return (
+                  <article className="forum-post-card" key={post.id}>
+                    <div className="forum-post-heading">
+                      <div className="forum-avatar">{post.author.slice(0, 1).toUpperCase()}</div>
+                      <div>
+                        <strong>{post.display_name || post.author}</strong>
+                        <small>{formatDate(post.created_at)}{post.edited_at ? " В· РёР·РјРµРЅРµРЅРѕ" : ""}</small>
+                      </div>
+                    </div>
+
+                    {editingPostId === post.id ? (
+                      <div className="forum-edit-form">
+                        <textarea value={editPostContent} onChange={(e) => setEditPostContent(e.target.value)} rows={5} maxLength={10000} />
+                        <div className="create-actions">
+                          <button className="forum-secondary" onClick={() => setEditingPostId(null)}>РћС‚РјРµРЅР°</button>
+                          <button className="forum-primary" onClick={() => void savePost(post.id)} disabled={saving}>РЎРѕС…СЂР°РЅРёС‚СЊ</button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="forum-post-content">
+                        {post.content.split("\n").map((line, index) => <p key={index}>{line || "\u00a0"}</p>)}
+                      </div>
+                    )}
+
+                    {canManagePost && editingPostId !== post.id && (
+                      <div className="forum-manage-actions">
+                        <button className="forum-secondary" onClick={() => {
+                          setEditingPostId(post.id);
+                          setEditPostContent(post.content);
+                        }}>РР·РјРµРЅРёС‚СЊ</button>
+                        <button className="forum-danger" onClick={() => void deletePost(post.id)} disabled={saving}>РЈРґР°Р»РёС‚СЊ</button>
+                      </div>
+                    )}
+                  </article>
+                );
+              })}
+              {!posts.length && <div className="forum-empty">РџРѕРєР° РЅРµС‚ РѕС‚РІРµС‚РѕРІ. РќР°С‡РЅРёС‚Рµ РѕР±СЃСѓР¶РґРµРЅРёРµ.</div>}
+            </div>
+
+            {!selectedTopic.is_locked ? (
+              <form className="forum-reply-form" onSubmit={createPost}>
+                <h3>Р’Р°С€ РѕС‚РІРµС‚</h3>
+                <textarea value={replyText} onChange={(e) => setReplyText(e.target.value)} placeholder="РќР°РїРёС€РёС‚Рµ СЃРѕРѕР±С‰РµРЅРёРµ..." rows={5} maxLength={10000} required />
+                <button className="forum-primary" type="submit" disabled={saving || !replyText.trim()}>
+                  {saving ? "РћС‚РїСЂР°РІРєР°..." : "РћС‚РїСЂР°РІРёС‚СЊ РѕС‚РІРµС‚"}
+                </button>
+              </form>
+            ) : (
+              <div className="forum-empty">Р­С‚Р° С‚РµРјР° Р·Р°РєСЂС‹С‚Р° РґР»СЏ РЅРѕРІС‹С… РѕС‚РІРµС‚РѕРІ.</div>
+            )}
+          </section>
+        ) : creating ? (
+          <section className="create-topic">
+            <button className="forum-back" onClick={() => setCreating(false)}>в†ђ РќР°Р·Р°Рґ Рє С‚РµРјР°Рј</button>
+            <div className="forum-kicker">РЎРћРћР‘Р©Р•РЎРўР’Рћ COMIND</div>
+            <h1>РЎРѕР·РґР°С‚СЊ С‚РµРјСѓ</h1>
+            <p className="forum-subtitle">РџРѕРґРµР»РёС‚РµСЃСЊ РёРґРµРµР№, Р·Р°РґР°Р№С‚Рµ РІРѕРїСЂРѕСЃ РёР»Рё РЅР°С‡РЅРёС‚Рµ РѕР±СЃСѓР¶РґРµРЅРёРµ.</p>
+            <form onSubmit={createTopic}>
+              <label>Р—Р°РіРѕР»РѕРІРѕРє С‚РµРјС‹
+                <input value={newTitle} onChange={(e) => setNewTitle(e.target.value)} placeholder="Р’РІРµРґРёС‚Рµ Р·Р°РіРѕР»РѕРІРѕРє..." minLength={5} maxLength={140} required />
+              </label>
+              <label>РљР°С‚РµРіРѕСЂРёСЏ
+                <select
+                  value={
+                    page === "news"
+                      ? (categories.find((item) => item.slug === "gaming-news")?.id ?? newCategory)
+                      : page === "articles"
+                        ? (categories.find((item) => item.slug === "guides")?.id ?? newCategory)
+                        : newCategory
+                  }
+                  onChange={(e) => setNewCategory(Number(e.target.value))}
+                  disabled={page === "news" || page === "articles"}
+                  required
+                >
+                  {categories.map((item) => (
+                    <option key={item.id} value={item.id}>{item.name}</option>
+                  ))}
+                </select>
+              </label>
+              <label>РўРµРєСЃС‚ РїСѓР±Р»РёРєР°С†РёРё
+                <textarea value={newText} onChange={(e) => setNewText(e.target.value)} placeholder="Рћ С‡С‘Рј С…РѕС‚РёС‚Рµ СЂР°СЃСЃРєР°Р·Р°С‚СЊ?" rows={8} minLength={10} maxLength={20000} required />
+              </label>
+              <div className="create-actions">
+                <span>РџСѓР±Р»РёРєР°С†РёСЏ Р±СѓРґРµС‚ СЃРѕС…СЂР°РЅРµРЅР° РІ Р±Р°Р·Рµ COMIND SOON.</span>
+                <button type="submit" className="forum-primary" disabled={saving || !categories.length}>
+                  {saving ? "РџСѓР±Р»РёРєР°С†РёСЏ..." : "РћРїСѓР±Р»РёРєРѕРІР°С‚СЊ С‚РµРјСѓ"}
+                </button>
+              </div>
+            </form>
+          </section>
+        ) : (
+          <>
+            <section className="forum-hero">
+              <div className="forum-hero-copy">
+                <div className="forum-kicker">GAMING COMMUNITY PLATFORM</div>
+                <h1>{page === "home" ? <>РњРµСЃС‚Рѕ, РіРґРµ <span>РёРіСЂС‹</span><br />РѕР±СЉРµРґРёРЅСЏСЋС‚ Р»СЋРґРµР№.</> : heading[page]}</h1>
+                <p>
+                  {page === "home"
+                    ? "РћР±СЃСѓР¶РґР°Р№С‚Рµ РёРіСЂС‹, РґРµР»РёС‚РµСЃСЊ РѕРїС‹С‚РѕРј, РЅР°С…РѕРґРёС‚Рµ РµРґРёРЅРѕРјС‹С€Р»РµРЅРЅРёРєРѕРІ Рё СЃРѕР·РґР°РІР°Р№С‚Рµ СЃРѕР±СЃС‚РІРµРЅРЅС‹Рµ С‚РµРјС‹."
+                    : "РћР±С‰Р°Р№С‚РµСЃСЊ, РїСѓР±Р»РёРєСѓР№С‚Рµ РјР°С‚РµСЂРёР°Р»С‹ Рё РЅР°С…РѕРґРёС‚Рµ РёРЅС‚РµСЂРµСЃРЅС‹Рµ РѕР±СЃСѓР¶РґРµРЅРёСЏ СЃРѕРѕР±С‰РµСЃС‚РІР°."}
+                </p>
+                <div className="forum-hero-actions">
+                  <button className="forum-primary" onClick={() => setCreating(true)}>пј‹ РЎРѕР·РґР°С‚СЊ С‚РµРјСѓ</button>
+                  <button className="forum-secondary" onClick={() => document.getElementById("forum-topics")?.scrollIntoView({ behavior: "smooth" })}>РЎРјРѕС‚СЂРµС‚СЊ РѕР±СЃСѓР¶РґРµРЅРёСЏ</button>
+                </div>
+              </div>
+              <div className="forum-hero-art">
+                <div className="orbit orbit-one" />
+                <div className="orbit orbit-two" />
+                <div className="hero-core">C<span>.</span></div>
+                <div className="hero-floating hero-floating-one">GAMES</div>
+                <div className="hero-floating hero-floating-two">COMMUNITY</div>
+              </div>
+            </section>
+
+            <section className="forum-stats">
+              <div><strong>{totalTopics.toLocaleString("ru-RU")}</strong><span>РћР±СЃСѓР¶РґРµРЅРёР№</span></div>
+              <div><strong>{categories.length}</strong><span>РљР°С‚РµРіРѕСЂРёР№</span></div>
+              <div><strong>{topics.reduce((sum, topic) => sum + topic.replies, 0).toLocaleString("ru-RU")}</strong><span>РћС‚РІРµС‚РѕРІ РІ СЃРїРёСЃРєРµ</span></div>
+              <div><strong>24/7</strong><span>РђРєС‚РёРІРЅРѕСЃС‚СЊ</span></div>
+            </section>
+
+            {(page === "home" || page === "forum") && (
+              <>
+                <section className="forum-section" id="forum-topics">
+                  <div className="forum-section-title">
+                    <div>
+                      <div className="forum-kicker">COMMUNITY DISCUSSIONS</div>
+                      <h2>РћР±СЃСѓР¶РґРµРЅРёСЏ СЃРѕРѕР±С‰РµСЃС‚РІР°</h2>
+                    </div>
+                    <button className="forum-link" onClick={() => {
+                      setSelectedCategory(null);
+                      setQuery("");
+                    }}>Р’СЃРµ С‚РµРјС‹ в†’</button>
+                  </div>
+
+                  <div className="forum-toolbar">
+                    <div className="forum-search">
+                      <span>вЊ•</span>
+                      <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="РџРѕРёСЃРє РїРѕ С‚РµРјР°Рј..." />
+                    </div>
+                    <select value={selectedCategory ?? ""} onChange={(e) => setSelectedCategory(e.target.value ? Number(e.target.value) : null)}>
+                      <option value="">Р’СЃРµ РєР°С‚РµРіРѕСЂРёРё</option>
+                      {categories.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+                    </select>
+                    <button className="forum-primary" onClick={() => setCreating(true)}>пј‹ РќРѕРІР°СЏ С‚РµРјР°</button>
+                  </div>
+
+                  <div className="forum-list-caption">
+                    {selectedCategoryName} В· РќР°Р№РґРµРЅРѕ С‚РµРј: {totalTopics}
+                  </div>
+
+                  <div className="topic-list">
+                    {loading && <div className="forum-empty">Р—Р°РіСЂСѓР·РєР°...</div>}
+                    {!loading && topics.map((topic) => (
+                      <button className="topic-row" key={topic.id} onClick={() => void openTopic(topic.id)}>
+                        <div className="topic-icon">в—€</div>
+                        <div className="topic-main">
+                          <strong>{topic.title}</strong>
+                          <span>{topic.category} <i>В·</i> {topic.author} <i>В·</i> {formatDate(topic.created_at)}</span>
+                        </div>
+                        <div className="topic-metric"><strong>{topic.replies}</strong><span>РѕС‚РІРµС‚РѕРІ</span></div>
+                        <div className="topic-metric"><strong>{topic.views.toLocaleString("ru-RU")}</strong><span>РїСЂРѕСЃРјРѕС‚СЂРѕРІ</span></div>
+                        {topic.is_pinned ? <span className="forum-pin">Р—Р°РєСЂРµРїР»РµРЅРѕ</span> : null}
+                        <span className="topic-arrow">вЂє</span>
+                      </button>
+                    ))}
+                    {!loading && !topics.length && <div className="forum-empty">РўРµРј РїРѕРєР° РЅРµС‚. РЎРѕР·РґР°Р№С‚Рµ РїРµСЂРІСѓСЋ РїСѓР±Р»РёРєР°С†РёСЋ.</div>}
+                  </div>
+                </section>
+
+                <section className="forum-section">
+                  <div className="forum-section-title">
+                    <div><div className="forum-kicker">EXPLORE</div><h2>РљР°С‚РµРіРѕСЂРёРё С„РѕСЂСѓРјР°</h2></div>
+                  </div>
+                  <div className="category-grid">
+                    {categories.map((item) => (
+                      <button className="category-card" key={item.id} onClick={() => {
+                        setSelectedCategory(item.id);
+                        document.getElementById("forum-topics")?.scrollIntoView({ behavior: "smooth" });
+                      }}>
+                        <span className="category-icon">в—€</span>
+                        <strong>{item.name}</strong>
+                        <p>{item.description}</p>
+                        <small>{item.topic_count} С‚РµРј <span>в†’</span></small>
+                      </button>
+                    ))}
+                  </div>
+                </section>
+              </>
+            )}
+
+            {(page === "news" || page === "articles") && (
+              <section className="forum-section">
+                <div className="forum-section-title">
+                  <div>
+                    <div className="forum-kicker">{page === "news" ? "LATEST UPDATES" : "EDITORIAL"}</div>
+                    <h2>{page === "news" ? "РќРѕРІРѕСЃС‚Рё РёРіСЂРѕРІРѕР№ РёРЅРґСѓСЃС‚СЂРёРё" : "РЎС‚Р°С‚СЊРё Рё СЂСѓРєРѕРІРѕРґСЃС‚РІР°"}</h2>
+                  </div>
+                  <span>{totalTopics} РїСѓР±Р»РёРєР°С†РёР№</span>
+                </div>
+
+                <div className="topic-list">
+                  {loading && <div className="forum-empty">Р—Р°РіСЂСѓР·РєР° РїСѓР±Р»РёРєР°С†РёР№...</div>}
+
+                  {!loading && topics.map((topic) => (
+                    <button className="topic-row" key={topic.id} onClick={() => void openTopic(topic.id)}>
+                      <div className="topic-icon">в—€</div>
+                      <div className="topic-main">
+                        <strong>{topic.title}</strong>
+                        <span>{topic.category} <i>В·</i> {topic.author} <i>В·</i> {formatDate(topic.created_at)}</span>
+                      </div>
+                      <div className="topic-metric">
+                        <strong>{topic.replies}</strong>
+                        <span>РѕС‚РІРµС‚РѕРІ</span>
+                      </div>
+                      <div className="topic-metric">
+                        <strong>{topic.views.toLocaleString("ru-RU")}</strong>
+                        <span>РїСЂРѕСЃРјРѕС‚СЂРѕРІ</span>
+                      </div>
+                      {topic.is_pinned ? <span className="forum-pin">Р—Р°РєСЂРµРїР»РµРЅРѕ</span> : null}
+                      <span className="topic-arrow">вЂє</span>
+                    </button>
+                  ))}
+
+                  {!loading && !topics.length && (
+                    <div className="forum-empty">
+                      Р’ СЌС‚РѕР№ РєР°С‚РµРіРѕСЂРёРё РїРѕРєР° РЅРµС‚ РїСѓР±Р»РёРєР°С†РёР№.
+                    </div>
+                  )}
+                </div>
+              </section>
+            )}
+
+            {page === "users" && (
+              <section className="forum-section">
+                <div className="forum-section-title">
+                  <div>
+                    <div className="forum-kicker">COMMUNITY</div>
+                    <h2>РЈС‡Р°СЃС‚РЅРёРєРё COMIND</h2>
+                  </div>
+                </div>
+
+                <form className="directory-search" onSubmit={searchUsers}>
+                  <input
+                    value={userQuery}
+                    onChange={(e) => setUserQuery(e.target.value)}
+                    placeholder="Р’РІРµРґРёС‚Рµ РёРјСЏ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ..."
+                    maxLength={100}
+                  />
+                  <button className="forum-primary" type="submit" disabled={searchLoading}>
+                    {searchLoading ? "РџРѕРёСЃРє..." : "РќР°Р№С‚Рё"}
+                  </button>
+                </form>
+
+                {usersSearched && (
+                  <div className="directory-results">
+                    {foundUsers.map((user) => (
+                      <article className="directory-user" key={user.id}>
+                        {user.avatar_url ? (
+                          <img className="forum-avatar directory-avatar" src={user.avatar_url} alt="" />
+                        ) : (
+                          <div className="forum-avatar">
+                            {(user.display_name || user.username).slice(0, 1).toUpperCase()}
+                          </div>
+                        )}
+                        <div>
+                          <strong>{user.display_name || user.username}</strong>
+                          <p>@{user.username}</p>
+                        </div>
+                      </article>
+                    ))}
+
+                    {!foundUsers.length && (
+                      <div className="forum-empty">РџРѕР»СЊР·РѕРІР°С‚РµР»Рё РЅРµ РЅР°Р№РґРµРЅС‹.</div>
+                    )}
+                  </div>
+                )}
+
+                {!usersSearched && (
+                  <div className="forum-empty">Р’РІРµРґРёС‚Рµ РёРјСЏ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ РґР»СЏ РїРѕРёСЃРєР° СѓС‡Р°СЃС‚РЅРёРєРѕРІ.</div>
+                )}
+              </section>
+            )}
+
+            {page === "profile" && (
+              <section className="forum-section">
+                <div className="forum-section-title">
+                  <div>
+                    <div className="forum-kicker">YOUR ACCOUNT</div>
+                    <h2>РџСЂРѕС„РёР»СЊ РїРѕР»СЊР·РѕРІР°С‚РµР»СЏ</h2>
+                  </div>
+                </div>
+
+                {profileLoading && <div className="forum-empty">Р—Р°РіСЂСѓР·РєР° РїСЂРѕС„РёР»СЏ...</div>}
+
+                {!profileLoading && profile && (
+                  <form className="profile-editor" onSubmit={saveProfile}>
+                    <div className="profile-editor-heading">
+                      {profile.avatar_url ? (
+                        <img className="forum-avatar profile-avatar-image" src={profile.avatar_url} alt="РђРІР°С‚Р°СЂ" />
+                      ) : (
+                        <div className="forum-avatar">
+                          {(profile.display_name || profile.username).slice(0, 1).toUpperCase()}
+                        </div>
+                      )}
+                      <div>
+                        <strong>{profile.display_name || profile.username}</strong>
+                        <p>@{profile.username}</p>
+                        <small>{userIsAdmin ? "РђРґРјРёРЅРёСЃС‚СЂР°С‚РѕСЂ" : "РЈС‡Р°СЃС‚РЅРёРє"} В· ID {profile.id}</small>
+                      </div>
+                    </div>
+
+                    <label>
+                      РћС‚РѕР±СЂР°Р¶Р°РµРјРѕРµ РёРјСЏ
+                      <input
+                        value={profile.display_name}
+                        maxLength={60}
+                        onChange={(e) => setProfile({ ...profile, display_name: e.target.value })}
+                      />
+                    </label>
+
+                    <label>
+                      Рћ СЃРµР±Рµ
+                      <textarea
+                        value={profile.bio}
+                        maxLength={500}
+                        rows={5}
+                        onChange={(e) => setProfile({ ...profile, bio: e.target.value })}
+                        placeholder="Р Р°СЃСЃРєР°Р¶РёС‚Рµ Рѕ СЃРµР±Рµ..."
+                      />
+                    </label>
+
+                    <label>
+                      РЎСЃС‹Р»РєР° РЅР° Р°РІР°С‚Р°СЂ РёР»Рё РёР·РѕР±СЂР°Р¶РµРЅРёРµ
+                      <input
+                        value={profile.avatar_url}
+                        maxLength={500000}
+                        onChange={(e) => setProfile({ ...profile, avatar_url: e.target.value })}
+                        placeholder="https://..."
+                      />
+                    </label>
+
+                    <label>
+                      РЎС‚Р°С‚СѓСЃ
+                      <select
+                        value={profile.status}
+                        onChange={(e) => setProfile({
+                          ...profile,
+                          status: e.target.value as Profile["status"],
+                        })}
+                      >
+                        <option value="online">Р’ СЃРµС‚Рё</option>
+                        <option value="away">РћС‚РѕС€С‘Р»</option>
+                        <option value="busy">РќРµ Р±РµСЃРїРѕРєРѕРёС‚СЊ</option>
+                        <option value="offline">РќРµ РІ СЃРµС‚Рё</option>
+                      </select>
+                    </label>
+
+                    <div className="profile-editor-footer">
+                      <span>{profile.email}</span>
+                      <button className="forum-primary" type="submit" disabled={profileSaving}>
+                        {profileSaving ? "РЎРѕС…СЂР°РЅРµРЅРёРµ..." : "РЎРѕС…СЂР°РЅРёС‚СЊ РїСЂРѕС„РёР»СЊ"}
+                      </button>
+                    </div>
+                  </form>
+                )}
+
+                {!profileLoading && !profile && (
+                  <div className="forum-empty">РќРµ СѓРґР°Р»РѕСЃСЊ Р·Р°РіСЂСѓР·РёС‚СЊ РїСЂРѕС„РёР»СЊ. РџСЂРѕРІРµСЂСЊС‚Рµ Р°РІС‚РѕСЂРёР·Р°С†РёСЋ.</div>
+                )}
+              </section>
+            )}
+          </>
+        )}
+
+        <footer className="forum-footer">
+          <span>COMIND SOON</span>
+          <span>РРіСЂРѕРІРѕРµ СЃРѕРѕР±С‰РµСЃС‚РІРѕ РЅРѕРІРѕРіРѕ РїРѕРєРѕР»РµРЅРёСЏ</span>
+          <span>В© 2026</span>
+        </footer>
+      </div>
+    </main>
+  );
+}
+
+
+
+========== frontend\src\ForumShell.css ==========
+.forum-shell {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow-y: auto;
+  color: #e9ecf8;
+  background:
+    radial-gradient(ellipse at 82% 0%, #28204a66, transparent 34%),
+    radial-gradient(ellipse at 5% 30%, #102d4660, transparent 35%),
+    #090d18;
+  font-family: Inter, "Segoe UI", Arial, sans-serif;
+}
+.forum-content { max-width: 1440px; width: 100%; margin: 0 auto; padding: 28px 48px 20px; }
+.forum-breadcrumb { display:flex; gap:11px; align-items:center; color:#77839e; font-size:11px; margin-bottom:24px; }
+.forum-breadcrumb span:first-child { color:#a58aff; font-weight:800; letter-spacing:1.5px; }
+.forum-hero { min-height:300px; display:flex; align-items:center; justify-content:space-between; gap:30px; padding:35px 48px; border:1px solid #292642; border-radius:20px; overflow:hidden; background:linear-gradient(110deg,#171a2b 0%,#17172c 55%,#21183a 100%); position:relative; }
+.forum-hero:after { content:""; position:absolute; inset:0; pointer-events:none; background:linear-gradient(90deg,transparent,#a18aff0b); }
+.forum-hero-copy { position:relative; z-index:2; max-width:620px; }
+.forum-kicker { color:#a58bff; font-size:10px; font-weight:800; letter-spacing:2px; margin-bottom:13px; }
+.forum-hero h1 { font-size:clamp(32px,4vw,49px); line-height:1.12; letter-spacing:-1.8px; margin:0 0 15px; }
+.forum-hero h1 span { color:#a78bfa; }
+.forum-hero p,.forum-subtitle { color:#9ba6bd; font-size:14px; line-height:1.7; max-width:570px; }
+.forum-hero-actions { display:flex; gap:11px; margin-top:25px; flex-wrap:wrap; }
+.forum-primary,.forum-secondary { border-radius:9px; padding:11px 16px; font-size:12px; font-weight:700; border:1px solid transparent; }
+.forum-primary { background:linear-gradient(135deg,#9b7bff,#704bd3); color:white; box-shadow:0 7px 25px #7651d633; }
+.forum-primary:hover { filter:brightness(1.12); }
+.forum-secondary { background:#ffffff08; border-color:#42405c; color:#d6d9e9; }
+.forum-secondary:hover { background:#ffffff12; }
+.forum-hero-art { width:280px; height:230px; flex-shrink:0; position:relative; display:grid; place-items:center; }
+.hero-core { width:112px; height:112px; display:grid; place-items:center; border:1px solid #a58bff88; border-radius:32px; transform:rotate(45deg); background:linear-gradient(145deg,#6049a8,#171c35); box-shadow:0 0 75px #8462ff66,inset 0 0 25px #ffffff18; font-size:55px; font-weight:900; }
+.hero-core span { color:#b9a6ff; }
+.orbit { position:absolute; border:1px solid #9980ff44; border-radius:50%; transform:rotate(-25deg); }
+.orbit-one { width:230px; height:130px; }
+.orbit-two { width:260px; height:190px; transform:rotate(35deg); }
+.hero-floating { position:absolute; padding:7px 11px; border:1px solid #554879; background:#17162a; color:#c5b5ff; border-radius:7px; font-size:9px; letter-spacing:1.5px; }
+.hero-floating-one { top:15px; right:0; }
+.hero-floating-two { bottom:17px; left:0; }
+.forum-stats { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:18px 0 34px; }
+.forum-stats div { display:flex; flex-direction:column; gap:6px; padding:16px 19px; border:1px solid #20283a; border-radius:12px; background:#101625; }
+.forum-stats strong { font-size:23px; color:#e6ddff; }
+.forum-stats span { color:#7f8ba5; font-size:11px; }
+.forum-section { margin:30px 0 38px; scroll-margin-top:20px; }
+.forum-section-title { display:flex; align-items:center; justify-content:space-between; gap:15px; margin-bottom:17px; }
+.forum-section-title h2 { font-size:21px; letter-spacing:-.5px; margin:0; }
+.forum-section-title .forum-kicker { margin-bottom:7px; }
+.forum-link,.forum-back { border:0; background:transparent; color:#a994ff; font-size:12px; }
+.forum-toolbar { display:flex; gap:10px; margin-bottom:13px; }
+.forum-search { flex:1; display:flex; align-items:center; gap:9px; min-width:140px; padding:0 12px; height:42px; border:1px solid #283149; border-radius:9px; background:#101625; color:#8c98b0; }
+.forum-search span { font-size:22px; }
+.forum-search input { width:100%; border:0; outline:0; background:transparent; color:#e8ecf7; font-size:12px; }
+.forum-toolbar select,.create-topic select { min-width:145px; border:1px solid #283149; border-radius:9px; padding:0 12px; color:#dce1f0; background:#101625; font-size:12px; }
+.topic-list { border:1px solid #222b3e; border-radius:12px; overflow:hidden; background:#0e1421; }
+.topic-row { width:100%; display:flex; align-items:center; gap:15px; text-align:left; padding:15px 17px; border:0; border-bottom:1px solid #20283a; background:transparent; color:inherit; }
+.topic-row:last-child { border-bottom:0; }
+.topic-row:hover { background:#171d2d; }
+.topic-icon { width:38px; height:38px; flex-shrink:0; display:grid; place-items:center; border-radius:11px; background:#292343; color:#b9a4ff; font-size:20px; }
+.topic-main { flex:1; min-width:0; display:flex; flex-direction:column; gap:7px; }
+.topic-main strong { font-size:13px; font-weight:650; }
+.topic-main span { color:#7e8ba4; font-size:10px; }
+.topic-main i { color:#a58bff; font-style:normal; padding:0 3px; }
+.topic-metric { width:65px; display:flex; flex-direction:column; gap:4px; text-align:center; }
+.topic-metric strong { font-size:12px; }
+.topic-metric span { font-size:9px; color:#7c88a1; }
+.topic-arrow { color:#8e7cc7; font-size:24px; }
+.forum-empty { padding:25px; text-align:center; color:#8290a9; font-size:12px; }
+.category-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; }
+.category-card { text-align:left; padding:19px; min-height:150px; border:1px solid #252d40; border-radius:12px; background:linear-gradient(145deg,#121a2a,#101522); color:#e8ecf7; }
+.category-card:hover { border-color:#725cb2; transform:translateY(-2px); }
+.category-icon { display:grid; place-items:center; width:35px; height:35px; margin-bottom:14px; border-radius:10px; background:#28213f; color:#b6a0ff; font-size:19px; }
+.category-card strong { font-size:13px; }
+.category-card p { min-height:30px; color:#8995ad; font-size:10px; line-height:1.5; }
+.category-card small { color:#a58bff; font-size:10px; }
+.category-card small span { float:right; }
+.editorial-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; }
+.editorial-grid article { border:1px solid #252d40; border-radius:13px; overflow:hidden; background:#111827; }
+.editorial-grid h3,.editorial-grid p { margin:14px 17px; }
+.editorial-grid h3 { font-size:15px; }
+.editorial-grid p { color:#8793aa; font-size:11px; line-height:1.6; }
+.editorial-art { min-height:170px; display:flex; align-items:center; justify-content:center; font-size:35px; font-weight:900; letter-spacing:4px; color:#d9ceff; background:radial-gradient(circle at 65% 40%,#7755c9,#24213f 60%,#111827); }
+.art-two { background:radial-gradient(circle at 30% 40%,#236d8b,#1a2946 65%,#111827); }
+.art-three { background:radial-gradient(circle at 65% 40%,#8a4f76,#38213f 65%,#111827); }
+.art-four { background:radial-gradient(circle at 30% 40%,#367b66,#1a3940 65%,#111827); }
+.profile-placeholder { display:flex; align-items:center; gap:16px; padding:22px; border:1px solid #252d40; border-radius:13px; background:#111827; }
+.profile-placeholder p { margin:6px 0 0; color:#8b97ae; font-size:11px; }
+.profile-placeholder>span { margin-left:auto; color:#818da5; font-size:11px; }
+.forum-avatar { width:42px; height:42px; display:grid; place-items:center; flex-shrink:0; border-radius:13px; background:linear-gradient(135deg,#8b6cf0,#376ba4); font-weight:800; }
+.topic-detail,.create-topic { max-width:900px; margin:0 auto 40px; }
+.topic-detail h1,.create-topic h1 { margin:14px 0; font-size:32px; letter-spacing:-1px; }
+.topic-author { display:flex; align-items:center; gap:11px; margin:22px 0; }
+.topic-author>div:last-child { display:flex; flex-direction:column; gap:5px; }
+.topic-author small { color:#8591a9; font-size:10px; }
+.topic-post { padding:24px; border:1px solid #252e42; border-radius:13px; background:#111827; color:#c8d0e1; font-size:13px; line-height:1.8; }
+.demo-note { color:#9d8bd2; font-size:11px; }
+.topic-actions { display:flex; align-items:center; gap:20px; margin:15px 0 35px; color:#8a96ae; font-size:11px; }
+.topic-actions button { margin-left:auto; padding:9px 15px; border:1px solid #514276; border-radius:8px; background:#211b36; color:#cbbdff; }
+.forum-section-title span { color:#7f8ba4; font-size:10px; }
+.create-topic form { display:flex; flex-direction:column; gap:17px; margin-top:25px; padding:22px; border:1px solid #252e42; border-radius:13px; background:#111827; }
+.create-topic label { display:flex; flex-direction:column; gap:8px; color:#aeb8cc; font-size:11px; }
+.create-topic input,.create-topic textarea { width:100%; border:1px solid #303a51; border-radius:8px; padding:12px; outline:0; color:#e8ecf7; background:#0c1320; font-size:12px; resize:vertical; }
+.create-topic input:focus,.create-topic textarea:focus { border-color:#8b70df; }
+.create-topic select { min-height:40px; }
+.create-actions { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.create-actions span { color:#7f8ba4; font-size:10px; }
+.forum-footer { display:flex; justify-content:space-between; gap:15px; padding:20px 0 8px; border-top:1px solid #20283a; color:#65718a; font-size:10px; }
+.forum-footer span:first-child { color:#a58bff; font-weight:800; letter-spacing:1.5px; }
+@media (max-width: 900px) {
+  .forum-content { padding:22px 22px; }
+  .forum-hero { padding:28px; }
+  .forum-hero-art { width:190px; transform:scale(.8); }
+  .category-grid { grid-template-columns:repeat(2,minmax(0,1fr)); }
+}
+@media (max-width: 620px) {
+  .forum-content { padding:16px 13px; }
+  .forum-hero { min-height:0; padding:25px 20px; }
+  .forum-hero-art { display:none; }
+  .forum-hero h1 { font-size:32px; }
+  .forum-stats { grid-template-columns:repeat(2,1fr); }
+  .category-grid,.editorial-grid { grid-template-columns:1fr; }
+  .forum-toolbar { flex-wrap:wrap; }
+  .forum-search { flex-basis:100%; }
+  .topic-metric { display:none; }
+  .topic-row { gap:10px; padding:13px 10px; }
+  .topic-main strong { font-size:11px; }
+  .forum-footer { flex-wrap:wrap; }
+  .profile-placeholder { flex-wrap:wrap; }
+  .profile-placeholder>span { width:100%; margin-left:0; }
+  .create-actions { align-items:flex-start; flex-direction:column; }
+}
+
+/* Р РµР°Р»СЊРЅР°СЏ СЂР°Р±РѕС‚Р° С„РѕСЂСѓРјР° */
+.forum-error {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  margin:0 0 18px;
+  padding:13px 16px;
+  border:1px solid #713d52;
+  border-radius:9px;
+  background:#351c2b;
+  color:#ffb6c7;
+  font-size:12px;
+}
+.forum-error button {
+  border:0;
+  background:transparent;
+  color:#ffd5df;
+}
+.forum-edit-form {
+  display:flex;
+  flex-direction:column;
+  gap:13px;
+  margin:18px 0;
+  padding:18px;
+  border:1px solid #303a51;
+  border-radius:12px;
+  background:#111827;
+}
+.forum-edit-form label {
+  display:flex;
+  flex-direction:column;
+  gap:8px;
+  color:#aeb8cc;
+  font-size:11px;
+}
+.forum-edit-form input,
+.forum-edit-form textarea,
+.forum-reply-form textarea {
+  width:100%;
+  border:1px solid #303a51;
+  border-radius:8px;
+  padding:12px;
+  outline:0;
+  color:#e8ecf7;
+  background:#0c1320;
+  font:inherit;
+  font-size:12px;
+  resize:vertical;
+}
+.forum-edit-form input:focus,
+.forum-edit-form textarea:focus,
+.forum-reply-form textarea:focus {
+  border-color:#8b70df;
+}
+.forum-manage-actions {
+  display:flex;
+  flex-wrap:wrap;
+  gap:9px;
+  margin:14px 0;
+}
+.forum-secondary,
+.forum-danger {
+  cursor:pointer;
+}
+.forum-danger {
+  padding:9px 13px;
+  border:1px solid #713d52;
+  border-radius:8px;
+  background:#351c2b;
+  color:#ffb6c7;
+  font-size:11px;
+}
+.forum-post-list {
+  display:flex;
+  flex-direction:column;
+  gap:12px;
+  margin:15px 0 25px;
+}
+.forum-post-card {
+  padding:18px;
+  border:1px solid #252e42;
+  border-radius:12px;
+  background:#111827;
+}
+.forum-post-heading {
+  display:flex;
+  align-items:center;
+  gap:11px;
+}
+.forum-post-heading>div:last-child {
+  display:flex;
+  flex-direction:column;
+  gap:5px;
+}
+.forum-post-heading small {
+  color:#8591a9;
+  font-size:10px;
+}
+.forum-post-content {
+  margin:15px 0 5px;
+  color:#c8d0e1;
+  font-size:13px;
+  line-height:1.8;
+  overflow-wrap:anywhere;
+}
+.forum-post-content p {
+  margin:0 0 8px;
+}
+.forum-reply-form {
+  display:flex;
+  flex-direction:column;
+  align-items:flex-start;
+  gap:12px;
+  padding:20px;
+  border:1px solid #252e42;
+  border-radius:12px;
+  background:#111827;
+}
+.forum-reply-form h3 {
+  margin:0;
+  font-size:15px;
+}
+.forum-reply-form textarea {
+  min-height:110px;
+}
+.forum-list-caption {
+  margin:0 0 10px;
+  color:#8290a9;
+  font-size:10px;
+}
+.forum-pin {
+  padding:5px 8px;
+  border:1px solid #554879;
+  border-radius:6px;
+  color:#c5b5ff;
+  font-size:9px;
+  white-space:nowrap;
+}
+.forum-shell button:disabled {
+  opacity:.55;
+  cursor:not-allowed;
+}
+
+/* РџРѕРёСЃРє СѓС‡Р°СЃС‚РЅРёРєРѕРІ */
+.directory-search {
+  display: flex;
+  gap: 10px;
+  margin: 18px 0;
+}
+.directory-search input,
+.profile-editor input,
+.profile-editor textarea,
+.profile-editor select {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid #303a51;
+  border-radius: 8px;
+  padding: 12px;
+  outline: 0;
+  color: #e8ecf7;
+  background: #0c1320;
+  font: inherit;
+  font-size: 12px;
+}
+.directory-search input:focus,
+.profile-editor input:focus,
+.profile-editor textarea:focus,
+.profile-editor select:focus {
+  border-color: #8b70df;
+}
+.directory-results {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.directory-user {
+  display: flex;
+  align-items: center;
+  gap: 13px;
+  padding: 15px;
+  border: 1px solid #252d40;
+  border-radius: 11px;
+  background: #111827;
+}
+.directory-user p,
+.profile-editor-heading p {
+  margin: 5px 0;
+  color: #8b97ae;
+  font-size: 11px;
+}
+.directory-avatar,
+.profile-avatar-image {
+  object-fit: cover;
+}
+
+/* Р РµРґР°РєС‚РёСЂРѕРІР°РЅРёРµ РїСЂРѕС„РёР»СЏ */
+.profile-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 760px;
+  padding: 22px;
+  border: 1px solid #252d40;
+  border-radius: 13px;
+  background: #111827;
+}
+.profile-editor label {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  color: #aeb8cc;
+  font-size: 11px;
+}
+.profile-editor textarea {
+  resize: vertical;
+}
+.profile-editor-heading {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid #252d40;
+}
+.profile-editor-heading small {
+  color: #8290a9;
+  font-size: 10px;
+}
+.profile-editor-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.profile-editor-footer span {
+  color: #8290a9;
+  font-size: 11px;
+}
+@media (max-width: 620px) {
+  .directory-search {
+    flex-direction: column;
+  }
+  .profile-editor {
+    padding: 15px;
+  }
+}

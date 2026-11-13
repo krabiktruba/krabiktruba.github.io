@@ -1,0 +1,415 @@
+﻿import { useMemo, useState } from "react";
+import type { FormEvent } from "react";
+import "./MainWindow.css";
+
+type Message = {
+  id: number;
+  author: string;
+  text: string;
+  time: string;
+};
+
+type Channel = {
+  id: number;
+  name: string;
+  type: "text" | "voice";
+};
+
+type Community = {
+  id: number;
+  name: string;
+  description: string;
+  channels: Channel[];
+};
+
+type Props = {
+  username: string;
+  onLogout: () => void;
+};
+
+const initialCommunities: Community[] = [
+  {
+    id: 1,
+    name: "COMIND",
+    description: "Главное сообщество",
+    channels: [
+      { id: 11, name: "новости", type: "text" },
+      { id: 12, name: "общий-чат", type: "text" },
+      { id: 13, name: "идеи-и-предложения", type: "text" },
+      { id: 14, name: "голосовой", type: "voice" },
+    ],
+  },
+  {
+    id: 2,
+    name: "Игровая зона",
+    description: "Игры, команды и поиск игроков",
+    channels: [
+      { id: 21, name: "общение", type: "text" },
+      { id: 22, name: "поиск-команды", type: "text" },
+      { id: 23, name: "голосовой", type: "voice" },
+    ],
+  },
+  {
+    id: 3,
+    name: "Разработка",
+    description: "Программирование и проекты",
+    channels: [
+      { id: 31, name: "разработка", type: "text" },
+      { id: 32, name: "помощь", type: "text" },
+    ],
+  },
+];
+
+const initialMessages: Record<number, Message[]> = {
+  11: [
+    { id: 1, author: "COMIND", text: "Добро пожаловать! Здесь будут новости сообщества.", time: "Система" },
+  ],
+  12: [
+    { id: 2, author: "COMIND", text: "Это общий чат. Напишите первое сообщение!", time: "Система" },
+  ],
+  13: [
+    { id: 3, author: "COMIND", text: "Предлагайте идеи по развитию сообщества.", time: "Система" },
+  ],
+  21: [
+    { id: 4, author: "COMIND", text: "Обсуждайте здесь любимые игры.", time: "Система" },
+  ],
+};
+
+export default function MainWindow({ username, onLogout }: Props) {
+  const [communities, setCommunities] = useState(initialCommunities);
+  const [communityId, setCommunityId] = useState(1);
+  const [channelId, setChannelId] = useState(12);
+  const [section, setSection] = useState("Сообщества");
+  const [search, setSearch] = useState("");
+  const [messageText, setMessageText] = useState("");
+  const [messages, setMessages] = useState(initialMessages);
+  const [notice, setNotice] = useState("");
+
+  const community = communities.find((item) => item.id === communityId) ?? communities[0];
+  const channel = community.channels.find((item) => item.id === channelId) ?? community.channels[0];
+  const channelMessages = messages[channel?.id] ?? [];
+
+  const visibleCommunities = useMemo(
+    () => communities.filter((item) =>
+      item.name.toLowerCase().includes(search.toLowerCase())
+    ),
+    [communities, search]
+  );
+
+  function chooseCommunity(id: number) {
+    const selected = communities.find((item) => item.id === id);
+    if (!selected) return;
+    setCommunityId(id);
+    setChannelId(selected.channels[0]?.id ?? 0);
+    setSection("Сообщества");
+    setNotice("");
+  }
+
+  function createCommunity() {
+    const name = window.prompt("Название нового сообщества:");
+    if (!name?.trim()) return;
+
+    const id = Date.now();
+    const created: Community = {
+      id,
+      name: name.trim(),
+      description: "Новое сообщество",
+      channels: [
+        { id: id + 1, name: "общий-чат", type: "text" },
+        { id: id + 2, name: "новости", type: "text" },
+      ],
+    };
+
+    setCommunities((old) => [...old, created]);
+    setCommunityId(id);
+    setChannelId(id + 1);
+    setSection("Сообщества");
+    setNotice("Сообщество создано в текущем интерфейсе.");
+  }
+
+  function createChannel() {
+    const name = window.prompt("Название нового канала:");
+    if (!name?.trim()) return;
+
+    const created: Channel = {
+      id: Date.now(),
+      name: name.trim().toLowerCase().replace(/\s+/g, "-"),
+      type: "text",
+    };
+
+    setCommunities((old) => old.map((item) =>
+      item.id === communityId
+        ? { ...item, channels: [...item.channels, created] }
+        : item
+    ));
+    setChannelId(created.id);
+    setSection("Сообщества");
+    setNotice("Канал создан в текущем интерфейсе.");
+  }
+
+  function sendMessage(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const text = messageText.trim();
+    if (!text || !channel || channel.type === "voice") return;
+
+    const created: Message = {
+      id: Date.now(),
+      author: username,
+      text,
+      time: new Date().toLocaleTimeString("ru-RU", {
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
+    };
+
+    setMessages((old) => ({
+      ...old,
+      [channel.id]: [...(old[channel.id] ?? []), created],
+    }));
+    setMessageText("");
+    setNotice("");
+  }
+
+  function navigate(value: string) {
+    setSection(value);
+    setNotice("");
+  }
+
+  return (
+    <div className="comind-layout">
+      <aside className="comind-rail">
+        <button className="comind-brand" title="Главная" onClick={() => navigate("Сообщества")}>C</button>
+        <div className="comind-rail-divider" />
+
+        {communities.map((item) => (
+          <button
+            key={item.id}
+            title={item.name}
+            className={`comind-community-icon ${communityId === item.id && section === "Сообщества" ? "active" : ""}`}
+            onClick={() => chooseCommunity(item.id)}
+          >
+            {item.name.slice(0, 2).toUpperCase()}
+          </button>
+        ))}
+
+        <button className="comind-add-community" title="Создать сообщество" onClick={createCommunity}>+</button>
+        <div className="comind-rail-spacer" />
+        <button className="comind-avatar" title={`Профиль: ${username}`} onClick={() => navigate("Профиль")}>
+          {username.slice(0, 1).toUpperCase()}
+        </button>
+      </aside>
+
+      <aside className="comind-sidebar">
+        <div className="comind-sidebar-top">
+          <div>
+            <div className="comind-eyebrow">ПЛАТФОРМА СООБЩЕСТВ</div>
+            <h2>COMIND<span className="comind-dot">.</span></h2>
+          </div>
+          <button className="comind-icon-button" title="Создать сообщество" onClick={createCommunity}>＋</button>
+        </div>
+
+        <label className="comind-search">
+          <span>⌕</span>
+          <input
+            aria-label="Поиск сообществ"
+            placeholder="Найти сообщество..."
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+          />
+          {search && <button onClick={() => setSearch("")} title="Очистить поиск">×</button>}
+        </label>
+
+        <div className="comind-nav-label">РАБОЧЕЕ ПРОСТРАНСТВО</div>
+        <button className={`comind-nav-item ${section === "Сообщества" ? "selected" : ""}`} onClick={() => navigate("Сообщества")}>
+          <span>▦</span> Сообщества
+        </button>
+        <button className={`comind-nav-item ${section === "Сообщения" ? "selected" : ""}`} onClick={() => navigate("Сообщения")}>
+          <span>✉</span> Сообщения
+        </button>
+        <button className={`comind-nav-item ${section === "Обзор" ? "selected" : ""}`} onClick={() => navigate("Обзор")}>
+          <span>◈</span> Обзор
+        </button>
+        <button className={`comind-nav-item ${section === "Настройки" ? "selected" : ""}`} onClick={() => navigate("Настройки")}>
+          <span>⚙</span> Настройки
+        </button>
+
+        <div className="comind-nav-label comind-community-heading">
+          <span>ВАШИ СООБЩЕСТВА</span>
+          <button title="Добавить сообщество" onClick={createCommunity}>＋</button>
+        </div>
+
+        <div className="comind-community-list">
+          {visibleCommunities.map((item) => (
+            <button
+              key={item.id}
+              className={`comind-community-row ${communityId === item.id && section === "Сообщества" ? "selected" : ""}`}
+              onClick={() => chooseCommunity(item.id)}
+            >
+              <span className="comind-community-mini">{item.name.slice(0, 1).toUpperCase()}</span>
+              <span className="comind-community-name">{item.name}</span>
+              <span className="comind-member-count">{item.channels.length}</span>
+            </button>
+          ))}
+          {visibleCommunities.length === 0 && <p className="comind-empty-small">Ничего не найдено</p>}
+        </div>
+
+        <div className="comind-account">
+          <div className="comind-avatar">{username.slice(0, 1).toUpperCase()}</div>
+          <div className="comind-account-info">
+            <strong>{username}</strong>
+            <span>Участник</span>
+          </div>
+          <button className="comind-icon-button" title="Выйти из аккаунта" onClick={onLogout}>↪</button>
+        </div>
+      </aside>
+
+      <main className="comind-main">
+        <header className="comind-topbar">
+          <div className="comind-breadcrumb">
+            <span>COMIND</span><span className="comind-breadcrumb-sep">/</span>
+            <strong>{section}</strong>
+            {section === "Сообщества" && <><span className="comind-breadcrumb-sep">/</span><span>{community.name}</span></>}
+          </div>
+          <div className="comind-topbar-actions">
+            <span className="comind-status"><i /> Локальный режим</span>
+            <button className="comind-profile-button" onClick={() => navigate("Профиль")}>
+              <span className="comind-avatar small">{username.slice(0, 1).toUpperCase()}</span>
+              <span>{username}</span>
+              <span>⌄</span>
+            </button>
+          </div>
+        </header>
+
+        {notice && <div className="comind-notice">{notice}</div>}
+
+        {section === "Сообщества" && (
+          <div className="comind-workspace">
+            <div className="comind-channel-sidebar">
+              <div className="comind-community-banner">
+                <div className="comind-community-cover">{community.name.slice(0, 1).toUpperCase()}</div>
+                <h3>{community.name}</h3>
+                <p>{community.description}</p>
+              </div>
+
+              <div className="comind-channel-heading">
+                <span>ТЕКСТОВЫЕ КАНАЛЫ</span>
+                <button title="Создать канал" onClick={createChannel}>＋</button>
+              </div>
+              {community.channels.filter((item) => item.type === "text").map((item) => (
+                <button
+                  key={item.id}
+                  className={`comind-channel ${channelId === item.id ? "active" : ""}`}
+                  onClick={() => { setChannelId(item.id); setNotice(""); }}
+                >
+                  <span>#</span>{item.name}
+                </button>
+              ))}
+
+              <div className="comind-channel-heading comind-voice-heading">
+                <span>ГОЛОСОВЫЕ КАНАЛЫ</span>
+                <button title="Создать канал" onClick={createChannel}>＋</button>
+              </div>
+              {community.channels.filter((item) => item.type === "voice").map((item) => (
+                <button
+                  key={item.id}
+                  className={`comind-channel ${channelId === item.id ? "active" : ""}`}
+                  onClick={() => { setChannelId(item.id); setNotice("Голосовой канал пока работает как демонстрация интерфейса."); }}
+                >
+                  <span>♬</span>{item.name}
+                </button>
+              ))}
+
+              <button className="comind-create-channel" onClick={createChannel}>＋ Создать канал</button>
+            </div>
+
+            <section className="comind-chat">
+              <div className="comind-chat-header">
+                <div className="comind-chat-title">
+                  <span className="comind-hash">{channel?.type === "voice" ? "♬" : "#"}</span>
+                  <div>
+                    <h3>{channel?.name ?? "Канал"}</h3>
+                    <p>{channel?.type === "voice" ? "Голосовой канал · демонстрация" : `Канал сообщества ${community.name}`}</p>
+                  </div>
+                </div>
+                <div className="comind-chat-actions">
+                  <button title="Участники" onClick={() => setNotice("Управление участниками будет подключено следующим этапом.")}>♙</button>
+                  <button title="Информация" onClick={() => setNotice(community.description)}>ⓘ</button>
+                </div>
+              </div>
+
+              {channel?.type === "voice" ? (
+                <div className="comind-feature-page">
+                  <div className="comind-feature-icon">♫</div>
+                  <h1>Голосовой канал</h1>
+                  <p>Интерфейс голосовой комнаты готов к дальнейшей интеграции.</p>
+                  <button className="comind-primary-button" onClick={() => setNotice("Для настоящего голосового общения нужно подключить WebRTC и сервер сигнализации.")}>Подключить голос</button>
+                </div>
+              ) : (
+                <>
+                  <div className="comind-message-list">
+                    <div className="comind-chat-welcome">
+                      <div className="comind-welcome-icon">#</div>
+                      <h2>Добро пожаловать в #{channel?.name}</h2>
+                      <p>Это начало канала. Общайтесь, делитесь идеями и помогайте друг другу.</p>
+                    </div>
+                    {channelMessages.map((message) => (
+                      <article className="comind-message" key={message.id}>
+                        <div className="comind-message-avatar">{message.author.slice(0, 1).toUpperCase()}</div>
+                        <div className="comind-message-content">
+                          <div className="comind-message-meta">
+                            <strong>{message.author}</strong><time>{message.time}</time>
+                          </div>
+                          <p>{message.text}</p>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                  <form className="comind-message-form" onSubmit={sendMessage}>
+                    <button type="button" title="Дополнительные действия" onClick={createChannel}>＋</button>
+                    <input
+                      aria-label="Текст сообщения"
+                      placeholder={`Написать в #${channel?.name ?? "канал"}...`}
+                      value={messageText}
+                      onChange={(event) => setMessageText(event.target.value)}
+                    />
+                    <button type="submit" className="comind-send-button" disabled={!messageText.trim()} title="Отправить сообщение">➤</button>
+                  </form>
+                  <p className="comind-local-hint">Демонстрационный режим: сообщения пока хранятся в памяти приложения.</p>
+                </>
+              )}
+            </section>
+          </div>
+        )}
+
+        {section !== "Сообщества" && (
+          <section className="comind-page">
+            <div className="comind-page-icon">
+              {section === "Обзор" ? "◈" : section === "Настройки" ? "⚙" : section === "Профиль" ? "♙" : "✉"}
+            </div>
+            <div className="comind-eyebrow">COMIND WORKSPACE</div>
+            <h1>{section}</h1>
+            {section === "Обзор" && <p>Выберите сообщество слева, чтобы открыть его каналы и чат.</p>}
+            {section === "Сообщения" && <p>Личные сообщения будут доступны после подключения соответствующего API.</p>}
+            {section === "Настройки" && (
+              <div className="comind-settings-card">
+                <div><strong>Аккаунт</strong><span>{username}</span></div>
+                <div><strong>Интерфейс</strong><span>Тёмная тема · фиолетовые акценты</span></div>
+                <div><strong>Режим</strong><span>Локальный демонстрационный интерфейс</span></div>
+                <button className="comind-secondary-button" onClick={onLogout}>Выйти из аккаунта</button>
+              </div>
+            )}
+            {section === "Профиль" && (
+              <div className="comind-profile-card">
+                <div className="comind-avatar large">{username.slice(0, 1).toUpperCase()}</div>
+                <h2>{username}</h2>
+                <p>Профиль участника COMIND</p>
+                <button className="comind-secondary-button" onClick={() => navigate("Настройки")}>Настройки аккаунта</button>
+                <button className="comind-danger-button" onClick={onLogout}>Выйти</button>
+              </div>
+            )}
+          </section>
+        )}
+      </main>
+    </div>
+  );
+}

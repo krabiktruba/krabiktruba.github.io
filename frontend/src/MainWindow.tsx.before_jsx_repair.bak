@@ -1,0 +1,1605 @@
+import DirectMessages from "./DirectMessages";
+import type { CSSProperties } from "react";
+import { useCallback, useEffect, useState } from "react";
+import "./MainWindow.css";
+import VoiceRoom from "./VoiceRoom";
+import FeaturePanel from "./FeaturePanel";
+import { appPrompt, appConfirm } from "./appDialog";
+
+const API = (import.meta.env.VITE_API_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
+
+type AnyRecord = {
+  id: number;
+  [key: string]: any;
+};
+
+type Community = AnyRecord & {
+  name: string;
+  description?: string;
+  member_count?: number;
+  visibility?: "public" | "private";
+  is_member?: boolean;
+};
+
+type Channel = AnyRecord & {
+  name: string;
+  channel_type?: string;
+  visibility?: "public" | "private";
+};
+
+type Message = AnyRecord & {
+  content: string;
+  user_id?: number;
+  username?: string;
+  created_at?: string;
+};
+
+type ProfileData = {
+  display_name: string;
+  bio: string;
+  avatar_url: string;
+  status: "online" | "away" | "busy" | "offline";
+};
+
+type FriendItem = {
+  id: number;
+  username: string;
+  display_name?: string;
+  avatar_url?: string;
+  status?: string;
+  request_id?: number;
+};
+
+type FriendsResponse = {
+  friends: FriendItem[];
+  incoming: FriendItem[];
+  outgoing: FriendItem[];
+};
+
+type CommunityInvitation = {
+  invitation_id: number;
+  community_id: number;
+  community_name: string;
+  visibility: "public" | "private";
+  inviter_id: number;
+  inviter_username: string;
+  inviter_display_name?: string;
+  inviter_avatar_url?: string;
+};
+
+async function apiRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const headers = new Headers(options.headers);
+  headers.set("Accept", "application/json");
+
+  if (options.body) headers.set("Content-Type", "application/json");
+
+  const token = localStorage.getItem("comind_access_token");
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+
+  let response: Response;
+  try {
+    response = await fetch(`${API}${path}`, { ...options, headers });
+  } catch {
+    throw new Error("Backend недоступен. Запусти сервер COMIND на порту 8000.");
+  }
+
+  const data = response.status === 204 ? null : await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const detail = (data as any)?.detail;
+    const message = Array.isArray(detail)
+      ? detail.map((x: any) => x.msg || "").join("; ")
+      : detail;
+    throw new Error(message || `Ошибка HTTP ${response.status}`);
+  }
+
+  return data as T;
+}
+
+function asArray<T>(value: any): T[] {
+  if (Array.isArray(value)) return value;
+  if (Array.isArray(value?.items)) return value.items;
+  if (Array.isArray(value?.results)) return value.results;
+  return [];
+}
+
+export default function MainWindow({
+  username,
+  userId,
+  userIsAdmin = false,
+  onLogout,
+}: {
+  username: string;
+  userId?: number;
+  userIsAdmin?: boolean;
+  onLogout: () => void;
+}) {
+  const [communities, setCommunities] = useState<Community[]>([]);
+  const [community, setCommunity] = useState<Community | null>(null);
+  const [channels, setChannels] = useState<Channel[]>([]);
+  const [channel, setChannel] = useState<Channel | null>(null);
+  const [voiceChannel, setVoiceChannel] = useState<Channel | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [messageText, setMessageText] = useState("");
+  const [search, setSearch] = useState("");
+  const [communityName, setCommunityName] = useState("");
+  const [communityDescription, setCommunityDescription] = useState("");
+  const [communityVisibility, setCommunityVisibility] = useState<"public" | "private">("public");
+  const [channelName, setChannelName] = useState("");
+  const [profile, setProfile] = useState<ProfileData>({
+    display_name: "", bio: "", avatar_url: "", status: "online",
+  });
+  const [profileDraft, setProfileDraft] = useState<ProfileData>({
+    display_name: "", bio: "", avatar_url: "", status: "online",
+  });
+  const [showProfileEditor, setShowProfileEditor] = useState(false);
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [showFriendsPanel, setShowFriendsPanel] = useState(false);
+  const [friends, setFriends] = useState<FriendItem[]>([]);
+  const [incomingFriends, setIncomingFriends] = useState<FriendItem[]>([]);
+  const [outgoingFriends, setOutgoingFriends] = useState<FriendItem[]>([]);
+  const [incomingCommunityInvites, setIncomingCommunityInvites] = useState<CommunityInvitation[]>([]);
+  const [friendUsername, setFriendUsername] = useState("");
+  const [friendNotice, setFriendNotice] = useState<{ text: string; error: boolean } | null>(null);
+  const [, setFriendsLoading] = useState(false);
+  const [editingMessageId, setEditingMessageId] = useState<number | null>(null);
+  const [editDraft, setEditDraft] = useState("");
+  const [channelVisibility, setChannelVisibility] = useState<"public" | "private">("public");
+  const [showCreateCommunity, setShowCreateCommunity] = useState(false);
+  const [showCreateChannel, setShowCreateChannel] = useState(false);
+  const [showCreateVoiceChannel, setShowCreateVoiceChannel] = useState(false);
+  const [voiceChannelName, setVoiceChannelName] = useState("");
+  const [voiceChannelVisibility, setVoiceChannelVisibility] = useState<"public" | "private">("public");
+  const [loading, setLoading] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [noticeError, setNoticeError] = useState(false);
+    const [bgToneCount, setBgToneCount] = useState<1 | 2 | 3>(() => {
+    const value = Number(localStorage.getItem("comind_bg_tone_count") || 3);
+    return value === 1 || value === 2 ? value : 3;
+  });
+  const [bgDirection, setBgDirection] = useState<"vertical" | "horizontal" | "diagonal" | "radial">(
+    () => (localStorage.getItem("comind_bg_direction") as "vertical" | "horizontal" | "diagonal" | "radial") || "diagonal"
+  );
+  const [bgBase, setBgBase] = useState(() => localStorage.getItem("comind_bg_base") || "#eafaff");
+  const [bgAccent, setBgAccent] = useState(() => localStorage.getItem("comind_bg_accent") || "#45b9e8");
+  const [bgGlow, setBgGlow] = useState(() => localStorage.getItem("comind_bg_glow") || "#ffffff");
+  const [uiTextColor, setUiTextColor] = useState(() => localStorage.getItem("comind_ui_text") || "#263342");
+  const [buttonColor, setButtonColor] = useState(() => localStorage.getItem("comind_button_color") || "#278fbe");
+  const [buttonTextColor, setButtonTextColor] = useState(() => localStorage.getItem("comind_button_text") || "#ffffff");
+
+  useEffect(() => {
+    localStorage.setItem("comind_bg_tone_count", String(bgToneCount));
+    localStorage.setItem("comind_bg_direction", bgDirection);
+    localStorage.setItem("comind_bg_base", bgBase);
+    localStorage.setItem("comind_bg_accent", bgAccent);
+    localStorage.setItem("comind_bg_glow", bgGlow);
+    localStorage.setItem("comind_ui_text", uiTextColor);
+    localStorage.setItem("comind_button_color", buttonColor);
+    localStorage.setItem("comind_button_text", buttonTextColor);
+  }, [bgToneCount, bgDirection, bgBase, bgAccent, bgGlow, uiTextColor, buttonColor, buttonTextColor]);
+
+  const backgroundColors = bgToneCount === 1
+    ? [bgBase]
+    : bgToneCount === 2
+      ? [bgBase, bgAccent]
+      : [bgBase, bgAccent, bgGlow];
+
+  const backgroundStops = backgroundColors
+    .map((color, index) =>
+      color + " " + Math.round(index * 100 / (backgroundColors.length - 1)) + "%"
+    )
+    .join(", ");
+
+  const backgroundValue = bgToneCount === 1
+    ? bgBase
+    : bgDirection === "radial"
+      ? "radial-gradient(ellipse at center, " + backgroundStops + ")"
+      : "linear-gradient(" +
+        (bgDirection === "vertical" ? "to bottom" :
+         bgDirection === "horizontal" ? "to right" : "to bottom right") +
+        ", " + backgroundStops + ")";
+
+  const backgroundStyle =
+ {
+    "--user-background": backgroundValue,
+    "--user-text": uiTextColor,
+    "--user-button": buttonColor,
+    "--user-button-text": buttonTextColor,
+  } as CSSProperties;
+
+  const notify = (text: string, isError = false) => {
+    setNotice(text);
+    setNoticeError(isError);
+  };
+  const loadProfile = useCallback(async (syncDraft = false) => {
+    try {
+      const data = await apiRequest<ProfileData>("/api/profile/me");
+      const normalized: ProfileData = {
+        display_name: data.display_name || "",
+        bio: data.bio || "",
+        avatar_url: data.avatar_url || "",
+        status: data.status || "online",
+      };
+      setProfile(normalized);
+      // Only initialize the editor draft on the first load/manual editor sync;
+      // the 10-second poll must never overwrite edits currently in progress.
+      if (syncDraft) setProfileDraft(normalized);
+    } catch (error) {
+      console.warn("Profile synchronization failed:", error);
+    }
+  }, []);
+
+
+
+  const loadCommunities = useCallback(async () => {
+    try {
+      const result = await apiRequest<any>("/api/communities/");
+      setCommunities(asArray<Community>(result));
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Не удалось загрузить сообщества", true);
+    }
+  }, []);
+
+  const loadChannels = useCallback(async (selected: Community) => {
+    setNotice("");
+    try {
+      const result = await apiRequest<any>(
+        `/api/communities/${selected.id}/channels`,
+      );
+      const items = asArray<Channel>(result);
+
+      // Меняем экран только после успешной проверки доступа.
+      setCommunity(selected);
+      setChannels(items);
+      setChannel(items[0] ?? null);
+      setMessages([]);
+
+      if (!items.length) {
+        notify("Ты вступил в сообщество, но в нём пока нет каналов.");
+      }
+      return true;
+    } catch (error) {
+      notify(
+        error instanceof Error ? error.message : "Не удалось загрузить каналы",
+        true,
+      );
+      return false;
+    }
+  }, []);
+
+  const [showFeaturePanel, setShowFeaturePanel] = useState(false);
+  useEffect(() => {
+    void loadProfile(true);
+    const timer = window.setInterval(() => void loadProfile(), 10000);
+    return () => window.clearInterval(timer);
+  }, [loadProfile]);
+
+  useEffect(() => {
+    if (!showFriendsPanel) return;
+    const timer = window.setInterval(() => void loadFriends(), 10000);
+    return () => window.clearInterval(timer);
+  }, [showFriendsPanel]);
+
+  useEffect(() => {
+    void loadCommunities();
+  }, [loadCommunities]);
+
+  useEffect(() => {
+    if (!channel || channel.channel_type === "voice") {
+      setMessages([]);
+      return;
+    }
+
+    let active = true;
+
+    const loadMessages = async () => {
+      try {
+        const result = await apiRequest<any>(
+          `/api/channels/${channel.id}/messages?limit=100`,
+        );
+        if (active) setMessages(asArray<Message>(result));
+      } catch (error) {
+        if (active) {
+          setMessages([]);
+          notify(error instanceof Error ? error.message : "Не удалось загрузить сообщения", true);
+        }
+      }
+    };
+
+    void loadMessages();
+    const interval = window.setInterval(() => void loadMessages(), 5000);
+
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [channel]);
+
+  // MESSAGE_STATUS_SYNC_V2
+  useEffect(() => {
+    if (!channel || channel.channel_type === "voice") return;
+    let active = true;
+
+    const refresh = async () => {
+      try {
+        const result = await apiRequest<any>(
+          `/api/channels/${channel.id}/messages?limit=100`
+        );
+        if (active) setMessages(asArray<Message>(result));
+      } catch {
+        // Сохраняем последний успешно загруженный список.
+      }
+    };
+
+    const timer = window.setInterval(() => void refresh(), 10000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [channel?.id]);
+
+  async function chooseCommunity(item: Community) {
+    if (loading) return;
+    if (community?.id !== item.id) setVoiceChannel(null);
+    setLoading(true);
+    setNotice("");
+    try {
+      const opened = await loadChannels(item);
+      if (opened) {
+        await loadCommunities();
+        notify(`Ты вошёл в «${item.name}».`);
+      }
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function joinCommunity(item: Community) {
+    if (loading) return;
+    if (community?.id !== item.id) setVoiceChannel(null);
+
+    setLoading(true);
+    setNotice("");
+
+    try {
+      await apiRequest(`/api/communities/${item.id}/join`, {
+        method: "POST",
+      });
+
+      const opened = await loadChannels(item);
+      await loadCommunities();
+
+      if (opened) {
+        notify(`Ты вступил в «${item.name}».`);
+      }
+    } catch (error) {
+      notify(
+        error instanceof Error ? error.message : "Не удалось вступить",
+        true,
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function createCommunity(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!communityName.trim()) return;
+
+    setLoading(true);
+    try {
+      const created = await apiRequest<Community>("/api/communities/", {
+        method: "POST",
+        body: JSON.stringify({
+          name: communityName.trim(),
+          description: communityDescription.trim(),
+          visibility: communityVisibility,
+        }),
+      });
+
+      setShowCreateCommunity(false);
+      setCommunityName("");
+      setCommunityDescription("");
+      setCommunityVisibility("public");
+      await loadCommunities();
+      notify("Сообщество создано.");
+      if (created?.id) await loadChannels(created);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Не удалось создать сообщество", true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function createChannel(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!community || !channelName.trim()) return;
+
+    setLoading(true);
+    try {
+      await apiRequest(`/api/communities/${community.id}/channels`, {
+        method: "POST",
+        body: JSON.stringify({ name: channelName.trim(), visibility: channelVisibility }),
+      });
+      setChannelName("");
+      setChannelVisibility("public");
+      setShowCreateChannel(false);
+      const updated = await apiRequest<any>(
+        `/api/communities/${community.id}/channels`,
+      );
+      const items = asArray<Channel>(updated);
+      setChannels(items);
+      if (items.length) setChannel(items[items.length - 1]);
+      notify("Канал создан.");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Не удалось создать канал", true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function createVoiceChannel(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    if (!community || !voiceChannelName.trim()) return;
+
+    const name = voiceChannelName.trim();
+    setLoading(true);
+
+    try {
+      await apiRequest(`/api/communities/${community.id}/voice-channels`, {
+        method: "POST",
+        body: JSON.stringify({ name, visibility: voiceChannelVisibility }),
+      });
+
+      const updated = await apiRequest<any>(
+        `/api/communities/${community.id}/channels`,
+      );
+
+      const items = asArray<Channel>(updated);
+      setChannels(items);
+
+      const created = items.find(
+        (item) => item.channel_type === "voice" && item.name === name
+      );
+
+      setVoiceChannelName("");
+      setVoiceChannelVisibility("public");
+      setShowCreateVoiceChannel(false);
+
+      if (created) {
+        selectChannel(created);
+      }
+
+      notify("Голосовая комната создана.");
+    } catch (error) {
+      notify(
+        error instanceof Error ? error.message : "Не удалось создать голосовую комнату",
+        true
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function sendMessage(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!channel || !messageText.trim()) return;
+
+    const content = messageText.trim();
+    setMessageText("");
+
+    try {
+      const sent = await apiRequest<Message>(
+        `/api/channels/${channel.id}/messages`,
+        {
+          method: "POST",
+          body: JSON.stringify({ content }),
+        },
+      );
+      setMessages((previous) => [...previous, sent]);
+    } catch (error) {
+      setMessageText(content);
+      notify(error instanceof Error ? error.message : "Сообщение не отправлено", true);
+    }
+  }
+
+  async function deleteMessage(item: Message) {
+    if (!(await appConfirm({ title: "\u0423\u0434\u0430\u043b\u0438\u0442\u044c \u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435?", message: "\u042d\u0442\u043e \u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0435 \u043d\u0435\u043b\u044c\u0437\u044f \u043e\u0442\u043c\u0435\u043d\u0438\u0442\u044c.", confirmText: "\u0423\u0434\u0430\u043b\u0438\u0442\u044c", danger: true }))) return;
+    try {
+      await apiRequest(`/api/messages/${item.id}`, { method: "DELETE" });
+      setMessages((previous) => previous.filter((message) => message.id !== item.id));
+      notify("Сообщение удалено.");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Не удалось удалить сообщение", true);
+    }
+  }
+
+  function editMessage(item: Message) {
+    setEditingMessageId(Number(item.id));
+    setEditDraft(item.content ?? "");
+  }
+
+  function cancelEditMessage() {
+    setEditingMessageId(null);
+    setEditDraft("");
+  }
+
+  async function saveEditedMessage(item: Message) {
+    const messageId = Number(item.id);
+    const content = editDraft.trim();
+
+    if (!Number.isInteger(messageId) || messageId < 1) {
+      notify("Не удалось определить ID сообщения.", true);
+      return;
+    }
+    if (!content) {
+      notify("Сообщение не может быть пустым.", true);
+      return;
+    }
+
+    try {
+      const updated = await apiRequest<Message>(`/api/messages/${messageId}`, {
+        method: "PUT",
+        body: JSON.stringify({ content }),
+      });
+
+      setMessages((previous) =>
+        previous.map((message) =>
+          Number(message.id) === messageId ? { ...message, ...updated } : message
+        )
+      );
+      setEditingMessageId(null);
+      setEditDraft("");
+      notify("Сообщение обновлено.");
+    } catch (error) {
+      notify(
+        error instanceof Error ? error.message : "Ошибка сохранения сообщения.",
+        true
+      );
+    }
+  }
+
+
+  async function invitePrivateVoiceMember() {
+    if (!voiceChannel || voiceChannel.visibility !== "private") return;
+
+    const target = await appPrompt({
+      title: "\u041f\u0440\u0438\u0433\u043b\u0430\u0448\u0435\u043d\u0438\u0435 \u0432 \u0433\u043e\u043b\u043e\u0441\u043e\u0432\u0443\u044e \u043a\u043e\u043c\u043d\u0430\u0442\u0443",
+      message: "\u0412\u0432\u0435\u0434\u0438\u0442\u0435 username \u0443\u0447\u0430\u0441\u0442\u043d\u0438\u043a\u0430 \u0441\u043e\u043e\u0431\u0449\u0435\u0441\u0442\u0432\u0430:",
+      placeholder: "username",
+      confirmText: "\u041f\u0440\u0438\u0433\u043b\u0430\u0441\u0438\u0442\u044c",
+    });
+    if (!target?.trim()) return;
+
+    try {
+      await apiRequest(`/api/channels/${voiceChannel.id}/members`, {
+        method: "POST",
+        body: JSON.stringify({ username: target.trim() }),
+      });
+      notify("\u0423\u0447\u0430\u0441\u0442\u043d\u0438\u043a " + target.trim() + " \u0434\u043e\u0431\u0430\u0432\u043b\u0435\u043d \u0432 \u043f\u0440\u0438\u0432\u0430\u0442\u043d\u0443\u044e \u0433\u043e\u043b\u043e\u0441\u043e\u0432\u0443\u044e \u043a\u043e\u043c\u043d\u0430\u0442\u0443.");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Invitation failed.", true);
+    }
+  }
+
+  async function invitePrivateMember() {
+    if (!channel || channel.visibility !== "private") return;
+
+    const target = await appPrompt({ title: "\u041f\u0440\u0438\u0433\u043b\u0430\u0448\u0435\u043d\u0438\u0435 \u0432 \u043f\u0440\u0438\u0432\u0430\u0442\u043d\u044b\u0439 \u043a\u0430\u043d\u0430\u043b", message: "\u0412\u0432\u0435\u0434\u0438\u0442\u0435 ID \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044f:", placeholder: "ID \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044f", confirmText: "\u041f\u0440\u0438\u0433\u043b\u0430\u0441\u0438\u0442\u044c" });
+    if (!target || !target.trim()) return;
+
+    try {
+      await apiRequest(`/api/channels/${channel.id}/members`, {
+        method: "POST",
+        body: JSON.stringify({ username: target.trim() }),
+      });
+      notify(`Участник ${target.trim()} приглашён в закрытый канал.`);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Не удалось пригласить участника", true);
+    }
+  }
+
+
+  const filtered = communities.filter((item) =>
+    `${item.name} ${item.description || ""}`.toLowerCase().includes(search.toLowerCase()),
+  );
+
+
+  async function saveProfile(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setProfileSaving(true);
+    try {
+      const updated = await apiRequest<ProfileData>("/api/profile/me", {
+        method: "PATCH",
+        body: JSON.stringify({
+          display_name: profileDraft.display_name.trim(),
+          bio: profileDraft.bio.trim(),
+          avatar_url: profileDraft.avatar_url.trim(),
+          status: profileDraft.status,
+        }),
+      });
+      const normalized: ProfileData = {
+        display_name: updated.display_name || "",
+        bio: updated.bio || "",
+        avatar_url: updated.avatar_url || "",
+        status: updated.status || "online",
+      };
+      setProfile(normalized);
+      setProfileDraft(normalized);
+      setShowProfileEditor(false);
+      notify("Профиль сохранён.");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Не удалось сохранить профиль.", true);
+    } finally {
+      setProfileSaving(false);
+    }
+  }
+
+  async function loadFriends() {
+    setFriendsLoading(true);
+    try {
+      const [result, invitations] = await Promise.all([
+        apiRequest<FriendsResponse>("/api/friends"),
+        apiRequest<CommunityInvitation[]>("/api/community-invitations/incoming"),
+      ]);
+
+      setFriends(Array.isArray(result.friends) ? result.friends : []);
+      setIncomingFriends(Array.isArray(result.incoming) ? result.incoming : []);
+      setOutgoingFriends(Array.isArray(result.outgoing) ? result.outgoing : []);
+      setIncomingCommunityInvites(
+        Array.isArray(invitations) ? invitations : []
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Не удалось загрузить друзей.";
+      setFriendNotice({ text: message, error: true });
+      notify(message, true);
+    } finally {
+      setFriendsLoading(false);
+    }
+  }
+
+  async function sendFriendRequest(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const name = friendUsername.trim();
+    if (!name) return;
+    setFriendNotice(null);
+    try {
+      const result = await apiRequest<{status: string; username?: string}>("/api/friends/requests", {
+        method: "POST",
+        body: JSON.stringify({ username: name }),
+      });
+      setFriendUsername("");
+      await loadFriends();
+      const labels: Record<string, string> = {
+        pending: "Запрос дружбы отправлен.",
+        accepted: "Вы теперь друзья.",
+        already_pending: "Запрос уже отправлен.",
+        already_friends: "Этот пользователь уже в друзьях.",
+      };
+      const message = labels[result.status] || "Запрос обработан.";
+      setFriendNotice({ text: message, error: false });
+      notify(message);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Не удалось отправить запрос.";
+      setFriendNotice({ text: message, error: true });
+      notify(message, true);
+    }
+  }
+
+  async function answerFriendRequest(item: FriendItem, action: "accept" | "reject") {
+    if (!item.request_id) return;
+    try {
+      await apiRequest(`/api/friends/requests/${item.request_id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ action }),
+      });
+      await loadFriends();
+      notify(action === "accept" ? "Запрос принят." : "Запрос отклонён.");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Не удалось обработать запрос.", true);
+    }
+  }
+
+
+  async function sendCommunityInvitation(item: FriendItem) {
+    if (!community) {
+      notify("\u0421\u043d\u0430\u0447\u0430\u043b\u0430 \u043e\u0442\u043a\u0440\u043e\u0439\u0442\u0435 \u0441\u043e\u043e\u0431\u0449\u0435\u0441\u0442\u0432\u043e.", true);
+      return;
+    }
+
+    try {
+      const result = await apiRequest<{ status: string }>(
+        `/api/communities/${community.id}/invitations`,
+        {
+          method: "POST",
+          body: JSON.stringify({ invitee_id: item.id }),
+        }
+      );
+
+      notify(
+        result.status === "already_pending"
+          ? "\u041f\u0440\u0438\u0433\u043b\u0430\u0448\u0435\u043d\u0438\u0435 \u0443\u0436\u0435 \u043e\u0436\u0438\u0434\u0430\u0435\u0442 \u043e\u0442\u0432\u0435\u0442\u0430."
+          : "\u041f\u0440\u0438\u0433\u043b\u0430\u0448\u0435\u043d\u0438\u0435 \u0432 \u0441\u043e\u043e\u0431\u0449\u0435\u0441\u0442\u0432\u043e \u043e\u0442\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u043e."
+      );
+    } catch (error) {
+      notify(
+        error instanceof Error ? error.message : "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043e\u0442\u043f\u0440\u0430\u0432\u0438\u0442\u044c \u043f\u0440\u0438\u0433\u043b\u0430\u0448\u0435\u043d\u0438\u0435.",
+        true
+      );
+    }
+  }
+
+  async function answerCommunityInvitation(
+    item: CommunityInvitation,
+    action: "accept" | "reject",
+  ) {
+    try {
+      await apiRequest(
+        `/api/community-invitations/${item.invitation_id}`,
+        {
+          method: "PATCH",
+          body: JSON.stringify({ action }),
+        }
+      );
+
+      await Promise.all([loadFriends(), loadCommunities()]);
+
+      notify(
+        action === "accept"
+          ? "\u041f\u0440\u0438\u0433\u043b\u0430\u0448\u0435\u043d\u0438\u0435 \u043f\u0440\u0438\u043d\u044f\u0442\u043e."
+          : "\u041f\u0440\u0438\u0433\u043b\u0430\u0448\u0435\u043d\u0438\u0435 \u043e\u0442\u043a\u043b\u043e\u043d\u0435\u043d\u043e."
+      );
+    } catch (error) {
+      notify(
+        error instanceof Error ? error.message : "\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043e\u0431\u0440\u0430\u0431\u043e\u0442\u0430\u0442\u044c \u043f\u0440\u0438\u0433\u043b\u0430\u0448\u0435\u043d\u0438\u0435.",
+        true
+      );
+    }
+  }
+
+  async function cancelFriendRequest(item: FriendItem) {
+    if (!item.request_id) {
+      const message = "Не найден идентификатор исходящего запроса. Обнови список друзей.";
+      setFriendNotice({ text: message, error: true });
+      notify(message, true);
+      return;
+    }
+    try {
+      await apiRequest(`/api/friends/requests/${item.request_id}`, { method: "DELETE" });
+      const message = "Запрос в друзья отменён.";
+      setFriendNotice({ text: message, error: false });
+      notify(message);
+      await loadFriends();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Не удалось отозвать запрос в друзья.";
+      setFriendNotice({ text: message, error: true });
+      notify(message, true);
+    }
+  }
+
+  async function removeFriend(item: FriendItem) {
+    if (!(await appConfirm({ title: "\u0423\u0434\u0430\u043b\u0438\u0442\u044c \u0438\u0437 \u0434\u0440\u0443\u0437\u0435\u0439", message: `\u0423\u0434\u0430\u043b\u0438\u0442\u044c ${item.username} \u0438\u0437 \u0434\u0440\u0443\u0437\u0435\u0439?`, confirmText: "\u0423\u0434\u0430\u043b\u0438\u0442\u044c", danger: true }))) return;
+    try {
+      await apiRequest(`/api/friends/${item.id}`, { method: "DELETE" });
+      await loadFriends();
+      notify("Пользователь удалён из друзей.");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Не удалось удалить друга.", true);
+    }
+  }
+
+  function selectChannel(item: Channel) {
+    setChannel(item);
+    if (item.channel_type === "voice") {
+      // Keep the active VoiceRoom mounted while the user opens text channels.
+      setVoiceChannel(item);
+    }
+  }
+
+  async function renameChannel(item: Channel) {
+    const entered = await appPrompt({ title: "\u041f\u0435\u0440\u0435\u0438\u043c\u0435\u043d\u043e\u0432\u0430\u0442\u044c \u043a\u0430\u043d\u0430\u043b", message: "\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u043d\u043e\u0432\u043e\u0435 \u043d\u0430\u0437\u0432\u0430\u043d\u0438\u0435 \u043a\u0430\u043d\u0430\u043b\u0430:", defaultValue: item.name, placeholder: "\u041d\u043e\u0432\u043e\u0435 \u043d\u0430\u0437\u0432\u0430\u043d\u0438\u0435", confirmText: "\u041f\u0435\u0440\u0435\u0438\u043c\u0435\u043d\u043e\u0432\u0430\u0442\u044c" });
+    if (entered === null) return;
+    const name = entered.trim();
+    if (name.length < 2 || name.length > 50 || !/^[\p{L}\p{N}_ -]+$/u.test(name)) {
+      notify("Название: 2–50 символов. Разрешены буквы любого языка, цифры, пробелы, _ и -.", true);
+      return;
+    }
+    try {
+      const updated = await apiRequest<{id: number; name: string}>(
+        `/api/channels/${item.id}`,
+        { method: "PATCH", body: JSON.stringify({ name }) }
+      );
+      const nextName = updated.name || name;
+      setChannels((previous) => previous.map((entry) =>
+        entry.id === item.id ? { ...entry, name: nextName } : entry
+      ));
+      setChannel((previous) =>
+        previous && previous.id === item.id ? { ...previous, name: nextName } : previous
+      );
+      notify("Канал переименован.");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Не удалось переименовать канал.", true);
+    }
+  }
+
+
+
+
+  async function deleteCommunity(item: Community) {
+    if (!(await appConfirm({ title: "\u0423\u0434\u0430\u043b\u0438\u0442\u044c \u0441\u043e\u043e\u0431\u0449\u0435\u0441\u0442\u0432\u043e", message: `\u0421\u043e\u043e\u0431\u0449\u0435\u0441\u0442\u0432\u043e \u00ab${item.name}\u00bb \u0431\u0443\u0434\u0435\u0442 \u0443\u0434\u0430\u043b\u0435\u043d\u043e \u0432\u043c\u0435\u0441\u0442\u0435 \u0441 \u043a\u0430\u043d\u0430\u043b\u0430\u043c\u0438 \u0438 \u0443\u0447\u0430\u0441\u0442\u043d\u0438\u043a\u0430\u043c\u0438. \u042d\u0442\u043e \u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0435 \u043d\u0435\u043e\u0431\u0440\u0430\u0442\u0438\u043c\u043e.`, confirmText: "\u0423\u0434\u0430\u043b\u0438\u0442\u044c \u0441\u043e\u043e\u0431\u0449\u0435\u0441\u0442\u0432\u043e", danger: true }))) return;
+    setLoading(true);
+    try {
+      await apiRequest(`/api/communities/${item.id}`, { method: "DELETE" });
+      setVoiceChannel(null);
+      setCommunity(null);
+      setChannel(null);
+      setChannels([]);
+      setMessages([]);
+      await loadCommunities();
+      notify(`Сообщество «${item.name}» удалено.`);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Не удалось удалить сообщество.", true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function leaveCommunity(item: Community) {
+    const isOwner = userId !== undefined && Number(item.owner_id) === Number(userId);
+    const question = isOwner
+      ? `Ты владелец «${item.name}». При выходе владение будет передано другому участнику. Продолжить?`
+      : `Покинуть сообщество «${item.name}»?`;
+    if (!(await appConfirm({ title: "\u041f\u043e\u043a\u0438\u043d\u0443\u0442\u044c \u0441\u043e\u043e\u0431\u0449\u0435\u0441\u0442\u0432\u043e", message: question, confirmText: "\u041f\u043e\u043a\u0438\u043d\u0443\u0442\u044c" }))) return;
+    setLoading(true);
+    try {
+      await apiRequest(`/api/communities/${item.id}/leave`, { method: "DELETE" });
+      setVoiceChannel(null);
+      setCommunity(null);
+      setChannel(null);
+      setChannels([]);
+      setMessages([]);
+      await loadCommunities();
+      notify(`Ты покинул сообщество «${item.name}».`);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Не удалось покинуть сообщество.", true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+
+  return (
+    <main className="comind" style={backgroundStyle}>
+      <aside className="comind-rail">
+        <div className="comind-logo">C<span>.</span></div>
+        <button className="rail-home active" title="Сообщества" onClick={() => {
+          setCommunity(null);
+          setChannel(null);
+        }}>⌂</button>
+        <div className="rail-divider" />
+        {communities.slice(0, 8).map((item) => (
+          <button
+            key={item.id}
+            className={`rail-community ${community?.id === item.id ? "selected" : ""}`}
+            title={item.name}
+            onClick={() => void chooseCommunity(item)}
+          >
+            {(item.name || "?").slice(0, 2).toUpperCase()}
+          </button>
+        ))}
+        <button className="rail-add" title="Создать сообщество" onClick={() => setShowCreateCommunity(true)}>＋</button>
+        <div className="rail-spacer" />
+        <button className="rail-profile" title={username}>{(profile.display_name || username || "U").slice(0, 1).toUpperCase()}</button>
+      </aside>
+
+      <aside className="comind-sidebar">
+        <header className="sidebar-header">
+          <div>
+            <div className="eyebrow">GAMING COMMUNITY</div>
+            <h1>COMIND<span> SOON</span></h1>
+          </div>
+          
+        </header>
+
+
+
+        <div className="user-card">
+          <div className="user-avatar">{(profile.display_name || username || "U").slice(0, 1).toUpperCase()}</div>
+          <div className="user-info">
+            <strong>{profile.display_name.trim() || username}</strong>
+            <span className={"profile-status profile-status-" + profile.status}>
+              <i className={"online-dot profile-dot-" + profile.status} />
+              {({ online: "В сети", away: "Не активен", busy: "Не беспокоить", offline: "Не в сети" } as Record<string, string>)[profile.status] || "В сети"}
+            </span>
+            {userIsAdmin && <span className="admin-role-badge">ADMIN</span>}
+          </div>
+                    <button className="icon-button" title="Редактировать профиль" onClick={() => { setProfileDraft(profile); setShowProfileEditor(true); }}>⚙</button>
+          <button className="icon-button" title="Выйти" onClick={onLogout}>⇥</button>
+        </div>
+
+        <nav className="sidebar-socials" aria-label="Social networks">
+          <div className="sidebar-socials-heading">СОЦИАЛЬНЫЕ СЕТИ</div>
+          <div className="sidebar-socials-links">
+            <a href="https://discord.com" target="_blank" rel="noopener noreferrer">Discord</a>
+            <a href="https://telegram.org" target="_blank" rel="noopener noreferrer">Telegram</a>
+            <a href="https://youtube.com" target="_blank" rel="noopener noreferrer">YouTube</a>
+            <a href="https://vk.com" target="_blank" rel="noopener noreferrer">VK</a>
+          </div>
+        </nav>
+
+        <button type="button" className="friends-open-button" onClick={() => { setFriendNotice(null); setShowFriendsPanel(true); void loadFriends(); }}>
+          ♧ Друзья
+        </button>
+
+        <div className="sidebar-section-title">
+          <span>СООБЩЕСТВА</span>
+          <button className="tiny-add" title="Создать сообщество" onClick={() => setShowCreateCommunity(true)}>＋</button>
+        </div>
+
+        <label className="search-box">
+          <span>⌕</span>
+          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Найти сообщество..." />
+        </label>
+
+        <div className="community-list">
+          {filtered.map((item) => (
+            <div key={item.id} className={`community-entry ${community?.id === item.id ? "current" : ""}`}>
+              <button className="community-select" onClick={() => void chooseCommunity(item)}>
+                <span className="community-avatar">{item.name.slice(0, 1).toUpperCase()}</span>
+                <span className="community-copy">
+                  <strong>{item.name}</strong>
+                  <small>{item.member_count ?? 0} участников</small>
+                </span>
+              </button>
+{item.visibility === "private" ? (
+                <button className="join-button" disabled title="\u041f\u0440\u0438\u0433\u043b\u0430\u0448\u0435\u043d\u0438\u0435 \u043e\u0431\u044f\u0437\u0430\u0442\u0435\u043b\u044c\u043d\u043e" aria-label="\u041f\u0440\u0438\u0432\u0430\u0442\u043d\u043e\u0435 \u0441\u043e\u043e\u0431\u0449\u0435\u0441\u0442\u0432\u043e">{"\uD83D\uDD12"}</button>
+              ) : (
+                <button className="join-button" title="\u0412\u0441\u0442\u0443\u043f\u0438\u0442\u044c" onClick={() => void joinCommunity(item)} disabled={loading} aria-label={`\u0412\u0441\u0442\u0443\u043f\u0438\u0442\u044c \u0432 ${item.name}`}>{loading ? "..." : "+"}</button>
+              )}
+            </div>
+          ))}
+          {!filtered.length && <p className="empty-small">Сообществ пока нет. Создай первое.</p>}
+        </div>
+
+        <div className="sidebar-footer">
+          <span className="status-led" /> API CLIENT
+          <span className="version">EARLY ACCESS</span>
+        </div>
+      </aside>
+
+      <section className="comind-workspace">
+        {notice && (
+          <div className={`notice ${noticeError ? "notice-error" : ""}`}>
+            <span>{notice}</span>
+            <button onClick={() => setNotice("")}>×</button>
+          </div>
+        )}
+
+        {community ? (
+          <>
+            <header className="workspace-header">
+              <div className="workspace-community-icon">{community.name.slice(0, 1).toUpperCase()}</div>
+              <div className="workspace-title">
+                <h2>{community.name}</h2>
+                <p>{community.description || "Игровое сообщество COMIND"}</p>
+              </div>
+              <div className="header-actions">
+                <span className="connection-pill"><i /> LIVE API</span>
+                <button
+                  className="secondary-button"
+                  disabled={loading}
+                  title="Выйти из сообщества. Если ты владелец, владение будет передано другому участнику."
+                  onClick={() => void leaveCommunity(community)}
+                >
+                  Выйти из сообщества
+                </button>
+                {userId !== undefined && Number(community.owner_id) === Number(userId) && (
+                  <button
+                    className="danger-button"
+                    disabled={loading}
+                    title="Удалить сообщество и все его данные"
+                    onClick={() => void deleteCommunity(community)}
+                  >
+                    Удалить
+                  </button>
+                )}
+              </div>
+            </header>
+
+            <div className="workspace-body">
+              <aside className="channel-sidebar">
+                <div className="channel-heading">
+                  <span>КАНАЛЫ</span>
+                  <button
+                    type="button"
+                    className="tiny-add"
+                    title="Создать текстовый канал"
+                    onClick={() => setShowCreateChannel(true)}
+                  >＋</button>
+                </div>
+
+                {channels.filter(item => item.channel_type !== "voice").map(item => (
+                  <div className="channel-row" key={item.id}>
+                    <button
+                      className={`channel-item ${channel?.id === item.id ? "active" : ""}`}
+                      onClick={() => selectChannel(item)}
+                    >
+                      <span className="channel-symbol">
+                        {item.visibility === "private" ? "🔒" : "#"}
+                      </span>
+                      <span>{item.name}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="channel-rename"
+                      title={"Переименовать канал " + item.name}
+                      aria-label={"Переименовать канал " + item.name}
+                      onClick={() => void renameChannel(item)}
+                    >✎</button>
+                  </div>
+                ))}
+
+                {!channels.some(item => item.channel_type !== "voice") && (
+                  <p className="empty-small">Нет текстовых каналов.</p>
+                )}
+
+                <div className="channel-bottom">
+                  <div className="channel-heading">
+                    <span>ГОЛОСОВЫЕ КОМНАТЫ</span>
+                    <button
+                      type="button"
+                      className="tiny-add"
+                      title="Создать голосовую комнату"
+                      onClick={() => setShowCreateVoiceChannel(true)}
+                    >＋</button>
+                  </div>
+
+                  {channels.filter(item => item.channel_type === "voice").map(item => (
+                    <div className="channel-row" key={item.id}>
+                      <button
+                        className={`channel-item ${channel?.id === item.id ? "active" : ""}`}
+                        onClick={() => selectChannel(item)}
+                      >
+                        <span className="channel-symbol">◖</span>
+                        <span>{item.name}</span>
+                      </button>
+                      <button
+                        type="button"
+                        className="channel-rename"
+                        title={"Переименовать канал " + item.name}
+                        aria-label={"Переименовать канал " + item.name}
+                        onClick={() => void renameChannel(item)}
+                      >✎</button>
+                    </div>
+                  ))}
+
+                  {!channels.some(item => item.channel_type === "voice") && (
+                    <p className="empty-small">Нет голосовых комнат.</p>
+                  )}
+
+                  <div className="feature-placeholder">
+                    <span>▣</span>
+                    <div>
+                      <b>Демонстрация экрана</b>
+                      <small>Следующий этап</small>
+                    </div>
+                  </div>
+                </div>
+              </aside>
+
+              <section className="chat-panel">
+                <div className={`voice-session ${channel?.channel_type === "voice" ? "voice-session-expanded" : voiceChannel ? "voice-session-docked" : "voice-session-empty"}`}>
+                  {voiceChannel && channel?.channel_type !== "voice" && (
+                    <div className="voice-dock-heading">
+                      <span>Голосовой канал: {voiceChannel.name}</span>
+                      <button type="button" onClick={() => setChannel(voiceChannel)}>Развернуть</button>
+                    </div>
+                  )}
+                  {voiceChannel && (
+                    <VoiceRoom
+                      key={voiceChannel.id}
+                      channelId={voiceChannel.id}
+                      channelName={voiceChannel.name}
+                      username={username}
+                      isPrivate={voiceChannel.visibility === "private"}
+                      onInvite={() => void invitePrivateVoiceMember()}
+                    />
+                  )}
+                </div>
+                {channel?.channel_type !== "voice" && (
+                  <div className="text-chat-view">
+  <header className="chat-header">
+    <div className="chat-hash">#</div>
+    <div><h3>{channel?.name || "Выбери канал"}</h3><p>{channel?.visibility === "private" ? "Закрытый канал · доступ по приглашению" : "Открытый канал сообщества"}</p></div>
+    <div className="chat-header-right">{channel?.visibility === "private" && <button type="button" className="private-invite" onClick={() => void invitePrivateMember()}>＋ Пригласить</button>}<span>{messages.length} сообщений</span></div>
+  </header>
+  
+  <div className="message-list">
+    {!channel && <div className="empty-state"><div className="empty-symbol">#</div><h3>Выбери канал</h3><p>Выбери канал слева, чтобы открыть переписку.</p></div>}
+    {channel && messages.length === 0 && <div className="empty-state"><div className="empty-symbol">✳</div><h3>Начни общение</h3><p>Здесь пока нет сообщений. Напиши первым.</p></div>}
+    {messages.map((item, index) => {
+      const author = String(item.username || item.author_name || item.author || (item.user_id === undefined ? "Участник" : `Участник ${item.user_id}`));
+      return (
+        <article className="message" key={item.id ?? `${index}-${item.content}`}>
+          <div className="message-avatar">{author.slice(0, 1).toUpperCase()}</div>
+          <div className="message-body">
+            <div className="message-meta">
+              <strong>{author}</strong>
+              {item.status && (
+                <span className={"message-presence presence-" + item.status}>
+                  {({ online: "В сети", away: "Не активен", busy: "Не беспокоить", offline: "Не в сети" } as Record<string, string>)[item.status] || item.status}
+                </span>
+              )}
+              <time>{item.created_at ? new Date(item.created_at).toLocaleString("ru-RU") : ""}</time>
+            </div>
+            {editingMessageId === Number(item.id) ? (
+              <div className="inline-message-editor">
+                <textarea
+                  autoFocus
+                  rows={3}
+                  maxLength={4000}
+                  value={editDraft}
+                  onChange={(event) => setEditDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") cancelEditMessage();
+                    if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+                      event.preventDefault();
+                      void saveEditedMessage(item);
+                    }
+                  }}
+                />
+                <div className="inline-message-editor-actions">
+                  <button type="button" onClick={() => void saveEditedMessage(item)}>
+                    Сохранить
+                  </button>
+                  <button type="button" onClick={cancelEditMessage}>
+                    Отмена
+                  </button>
+                </div>
+                <small>Ctrl+Enter — сохранить · Esc — отменить</small>
+              </div>
+            ) : (
+              <p>{item.content}</p>
+            )}
+          </div>
+          {(item.username === username || userIsAdmin) && (
+            <button className="message-edit" title="Редактировать сообщение" onClick={() => void editMessage(item)}>✎</button>
+          )}
+          <button className="message-delete" title="Удалить сообщение" onClick={() => void deleteMessage(item)}>×</button>
+        </article>
+      );
+    })}
+  </div>
+  
+  <form className="message-composer" onSubmit={sendMessage}>
+    <button type="button" className="composer-plus" title="Дополнительные функции" onClick={() => notify("Вложения будут добавлены следующим этапом.")}>＋</button>
+    <input
+      value={messageText}
+      onChange={(e) => setMessageText(e.target.value)}
+      placeholder={channel ? `Написать в #${channel.name}` : "Сначала выбери канал"}
+      disabled={!channel || loading}
+      maxLength={4000}
+    />
+    <span className="composer-hint">Enter ↵</span>
+    <button className="send-button" type="submit" disabled={!channel || !messageText.trim() || loading}>➤</button>
+  </form>
+  <div className="chat-footnote">Пожалуйста, соблюдай правила сообщества.</div>
+                  </div>
+                )}
+              </div></details>
+
+              <aside className="members-panel">
+                <div className="members-heading">СООБЩЕСТВО</div>
+                <div className="community-cover"><div className="cover-orb orb-one" /><div className="cover-orb orb-two" /><span>{community.name.slice(0, 1).toUpperCase()}</span></div>
+                <h3 className="member-community-name">{community.name}</h3>
+                <p className="member-description">{community.description || "Место для общения, игр и совместных проектов."}</p>
+                <div className="member-stat-row"><span>Участники</span><strong>{community.member_count ?? "—"}</strong></div>
+                <div className="member-stat-row"><span>Каналы</span><strong>{channels.length}</strong></div>
+                <div className="member-stat-row"><span>Соединение</span><strong className="green-text">API</strong></div>
+                <button className="wide-primary" onClick={() => void joinCommunity(community)} disabled={loading}>Вступить в сообщество</button>
+                <div className="next-features"><span>В РАЗРАБОТКЕ</span><p>Роли и права доступа</p><p>Голосовые комнаты</p><p>AI-помощник</p><p>Рейтинг и достижения</p></div>
+              </aside>
+            </div>
+          </>
+        ) : (
+          <div className="discover-view">
+            <header className="discover-top"><span className="connection-pill"><i /> COMIND PLATFORM</span></header>
+            <div className="discover-content">
+              
+              <h2>Играй вместе.<br /><span>Создавай сообщества.</span></h2>
+              <p className="hero-description">Единое пространство для игровых сообществ, общения и совместных проектов.</p>
+              <div className="discover-actions"><button className="primary-button" onClick={() => setShowCreateCommunity(true)}>＋ Создать сообщество</button><button className="secondary-button" onClick={() => document.getElementById("community-catalog")?.scrollIntoView({ behavior: "smooth" })}>Найти сообщество ↓</button></div>
+              <div className="feature-grid">
+                <div className="feature-card"><span className="feature-icon purple">⌘</span><h3>Свои сообщества</h3><p>Создавай пространства и собирай игроков.</p></div>
+                <div className="feature-card"><span className="feature-icon blue">#</span><h3>Общение</h3><p>Текстовые каналы и сообщения, подключённые к backend.</p></div>
+                <div className="feature-card"><span className="feature-icon pink">✧</span><h3>Развитие</h3><p>Роли, достижения, голос и AI — следующие модули.</p></div>
+              </div>
+              <div id="community-catalog" className="catalog-heading"><div><h3>Сообщества</h3></div><span>{filtered.length} найдено</span></div>
+              <div className="discover-community-grid">
+                {filtered.map((item) => <button key={item.id} className="discover-community-card" onClick={() => void chooseCommunity(item)}><div className="discover-card-icon">{item.name.slice(0, 1).toUpperCase()}</div><div><strong>{item.name}</strong><p>{item.description || "Игровое сообщество COMIND"}</p><small>{item.member_count ?? 0} участников</small></div><span className="card-arrow">↗</span></button>)}
+                {!filtered.length && <div className="catalog-empty">Сообщества не найдены. Создай своё или обнови список.</div>}
+              </div>
+               <footer className="discover-donation">
+                 <div className="discover-donation-copy">
+                   <span>COMIND COMMUNITY</span>
+                   <h3>Поддержать COMIND</h3>
+                   <p>Помоги развитию проекта. Здесь появится персональная ссылка для доната.</p>
+                 </div>
+                 <a
+                   href="https://ko-fi.com/"
+                   target="_blank"
+                   rel="noopener noreferrer"
+                   className="donation-link"
+                 >
+                   Поддержать проект ↗
+                 </a>
+               </footer>
+            </div>
+          </div>
+        )}
+      </section>
+
+      {/* PROFILE_AND_FRIENDS_MODALS_V1 */}
+      {showProfileEditor && (
+        <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) setShowProfileEditor(false); }}>
+          <form className="comind-modal account-profile-modal" onSubmit={saveProfile}>
+            <button type="button" className="modal-close" onClick={() => setShowProfileEditor(false)}>×</button>
+            <span className="eyebrow">АККАУНТ</span>
+            <h2>Профиль</h2>
+            <label>Отображаемое имя
+              <input value={profileDraft.display_name} maxLength={60}
+                onChange={(e) => setProfileDraft((p) => ({ ...p, display_name: e.target.value }))}
+                placeholder={username} />
+            </label>
+            <label>О себе
+              <textarea value={profileDraft.bio} rows={3} maxLength={500}
+                onChange={(e) => setProfileDraft((p) => ({ ...p, bio: e.target.value }))}
+                placeholder="Расскажи о себе" />
+            </label>
+            <label>Статус
+              <select value={profileDraft.status}
+                onChange={(e) => setProfileDraft((p) => ({ ...p, status: e.target.value as ProfileData["status"] }))}>
+                <option value="online">В сети</option>
+                <option value="away">Не активен</option>
+                <option value="busy">Не беспокоить</option>
+                <option value="offline">Не в сети</option>
+              </select>
+            </label>
+            <label>URL аватара (HTTPS)
+              <input value={profileDraft.avatar_url} maxLength={500000}
+                onChange={(e) => setProfileDraft((p) => ({ ...p, avatar_url: e.target.value }))}
+                placeholder="https://..." />
+            </label>
+                        <details className="appearance-settings-section">
+  <summary className="appearance-settings-toggle">
+    <span className="appearance-toggle-title">Внешний вид</span>
+    <span className="appearance-toggle-description">Настройки оформления интерфейса</span>
+    <span className="appearance-toggle-arrow">⌄</span>
+  </summary>
+  <div className="appearance-settings-content"><div className="appearance-presets">
+                <button type="button" onClick={() => {
+                  setBgToneCount(3);
+                  setBgBase("#eafaff");
+                  setBgAccent("#45b9e8");
+                  setBgGlow("#ffffff");
+                  setBgDirection("diagonal");
+                }}>Сине-белая</button>
+                <button type="button" onClick={() => {
+                  setBgToneCount(3);
+                  setBgBase("#a77a4d");
+                  setBgAccent("#718b55");
+                  setBgGlow("#d5c79a");
+                  setBgDirection("diagonal");
+                }}>Коричнево-зелёная</button>
+                <button type="button" onClick={() => {
+                  setBgToneCount(3);
+                  setBgBase("#d6d9dc");
+                  setBgAccent("#555b63");
+                  setBgGlow("#202124");
+                  setBgDirection("diagonal");
+                }}>Серо-чёрная</button>
+              </div>
+
+              <label className="appearance-control">
+                <span>Количество оттенков</span>
+                <select value={bgToneCount}
+                  onChange={(event) => setBgToneCount(Number(event.target.value) as 1 | 2 | 3)}>
+                  <option value={1}>Один цвет</option>
+                  <option value={2}>Два цвета</option>
+                  <option value={3}>Три цвета</option>
+                </select>
+              </label>
+
+              {bgToneCount > 1 && (
+                <label className="appearance-control">
+                  <span>Направление градиента</span>
+                  <select value={bgDirection}
+                    onChange={(event) => setBgDirection(event.target.value as typeof bgDirection)}>
+                    <option value="vertical">Вертикальное</option>
+                    <option value="horizontal">Горизонтальное</option>
+                    <option value="diagonal">Диагональное</option>
+                    <option value="radial">Радиальное</option>
+                  </select>
+                </label>
+              )}
+
+              <div className="appearance-color-grid">
+                <label className="appearance-color-control">
+                  <span>Основной цвет</span>
+                  <input type="color" value={bgBase} onChange={(event) => setBgBase(event.target.value)} />
+                </label>
+
+                {bgToneCount > 1 && (
+                  <label className="appearance-color-control">
+                    <span>Второй цвет</span>
+                    <input type="color" value={bgAccent} onChange={(event) => setBgAccent(event.target.value)} />
+                  </label>
+                )}
+
+                {bgToneCount > 2 && (
+                  <label className="appearance-color-control">
+                    <span>Третий цвет</span>
+                    <input type="color" value={bgGlow} onChange={(event) => setBgGlow(event.target.value)} />
+                  </label>
+                )}
+
+                <label className="appearance-color-control">
+                  <span>Цвет текста интерфейса</span>
+                  <input type="color" value={uiTextColor} onChange={(event) => setUiTextColor(event.target.value)} />
+                </label>
+
+                <label className="appearance-color-control">
+                  <span>Цвет фона кнопок</span>
+                  <input type="color" value={buttonColor} onChange={(event) => setButtonColor(event.target.value)} />
+                </label>
+
+                <label className="appearance-color-control">
+                  <span>Цвет текста кнопок</span>
+                  <input type="color" value={buttonTextColor} onChange={(event) => setButtonTextColor(event.target.value)} />
+                </label>
+              </div>
+
+              <div className="appearance-preview">
+                <span>Предварительный просмотр</span>
+                <div className="appearance-preview-surface" style={{ background: backgroundValue, color: uiTextColor }}>
+                  <strong>COMIND SOON</strong>
+                  <span>Пример оформления интерфейса</span>
+                  <button type="button" style={{ background: buttonColor, color: buttonTextColor }}>
+                    Пример кнопки
+                  </button>
+                </div>
+              </div>
+            </section>
+            <button className="wide-primary" type="submit" disabled={profileSaving}>
+              {profileSaving ? "Сохраняем..." : "Сохранить профиль"}
+            </button>
+          </form>
+        </div>
+      )}
+
+      {showFriendsPanel && (
+        <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowFriendsPanel(false); }}>
+          <section className="comind-modal friends-modal">
+            <button type="button" className="modal-close" onClick={() => setShowFriendsPanel(false)}>×</button>
+            <span className="eyebrow">СОЦИАЛЬНАЯ СЕТЬ</span>
+            <h2>Друзья</h2>
+            <form className="friend-add-form" onSubmit={sendFriendRequest}>
+              <label>Имя пользователя
+                <input value={friendUsername} onChange={(event) => setFriendUsername(event.target.value)}
+                  minLength={3} maxLength={32} pattern="[A-Za-z0-9_]+"
+                  placeholder="Например, player_01" required />
+              </label>
+              <button type="submit" className="wide-primary">Отправить запрос</button>
+            </form>
+            {friendNotice && (
+              <p className={`friend-notice ${friendNotice.error ? "is-error" : "is-success"}`} role="status">
+                {friendNotice.text}
+              </p>
+            )}
+
+            <div className="friends-modal-section">
+              <h3>Входящие · {incomingFriends.length}</h3>
+              {incomingFriends.map((item) => (
+                <div className="friend-entry" key={item.request_id}>
+                  <strong>{item.display_name || item.username}</strong>
+                  <div>
+                    <button type="button" onClick={() => void answerFriendRequest(item, "accept")}>Принять</button>
+                    <button type="button" onClick={() => void answerFriendRequest(item, "reject")}>Отклонить</button>
+                  </div>
+                </div>
+              ))}
+              {!incomingFriends.length && <p className="empty-small">Нет входящих запросов.</p>}
+            </div>
+
+
+            <div className="friends-modal-section">
+              <h3>{"\u041f\u0440\u0438\u0433\u043b\u0430\u0448\u0435\u043d\u0438\u044f \u0432 \u0441\u043e\u043e\u0431\u0449\u0435\u0441\u0442\u0432\u0430"} ? {incomingCommunityInvites.length}</h3>
+              {incomingCommunityInvites.map((item) => (
+                <div className="friend-entry" key={item.invitation_id}>
+                  <div>
+                    <strong>{item.community_name}</strong>
+                    <small>
+                      {"\u041e\u0442"} {item.inviter_display_name || item.inviter_username}
+                      {" ? "}
+                      {item.visibility === "private" ? "PRIVATE" : "PUBLIC"}
+                    </small>
+                  </div>
+                  <div>
+                    <button
+                      type="button"
+                      onClick={() => void answerCommunityInvitation(item, "accept")}
+                    >
+                      {"\u041f\u0440\u0438\u043d\u044f\u0442\u044c"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void answerCommunityInvitation(item, "reject")}
+                    >
+                      {"\u041e\u0442\u043a\u043b\u043e\u043d\u0438\u0442\u044c"}
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {!incomingCommunityInvites.length && (
+                <p className="empty-small">
+                  {"\u041d\u0435\u0442 \u0432\u0445\u043e\u0434\u044f\u0449\u0438\u0445 \u043f\u0440\u0438\u0433\u043b\u0430\u0448\u0435\u043d\u0438\u0439."}
+                </p>
+              )}
+            </div>
+
+            <div className="friends-modal-section">
+              <h3>Друзья · {friends.length}</h3>
+              {friends.map((item) => (
+                <div className="friend-entry" key={item.id}>
+                  <div>
+                    <strong>{item.display_name || item.username}</strong>
+                    <small>{item.status || "offline"}</small>
+                  </div>
+                  {community && (
+                    <button type="button" onClick={() => void sendCommunityInvitation(item)}>
+                      {"\u041f\u0440\u0438\u0433\u043b\u0430\u0441\u0438\u0442\u044c"}
+                    </button>
+                  )}
+                  <button type="button" onClick={() => void removeFriend(item)}>Удалить</button>
+                </div>
+              ))}
+              {!friends.length && <p className="empty-small">Пока нет друзей.</p>}
+            </div>
+
+            <div className="friends-modal-section">
+              <h3>Отправленные · {outgoingFriends.length}</h3>
+              {outgoingFriends.map((item) => (
+                <div className="friend-entry" key={item.request_id}>
+                  <strong>{item.display_name || item.username}</strong>
+                  <button type="button" onClick={() => void cancelFriendRequest(item)}>Отозвать</button>
+                </div>
+              ))}
+              {!outgoingFriends.length && <p className="empty-small">Нет ожидающих запросов.</p>}
+            </div>
+          </section>
+        </div>
+      )}
+
+      {showCreateCommunity && (
+        <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) setShowCreateCommunity(false); }}>
+          <form className="comind-modal" onSubmit={createCommunity}>
+            <button type="button" className="modal-close" onClick={() => setShowCreateCommunity(false)}>×</button>
+            <span className="eyebrow">НОВОЕ ПРОСТРАНСТВО</span>
+            <h2>Создать сообщество</h2>
+            <p>Создай место для своей команды и сообщества.</p>
+            <label>Название<input autoFocus value={communityName} onChange={(e) => setCommunityName(e.target.value)} maxLength={80} required placeholder="Например, Minecraft Squad" /></label>
+            <label>Описание<textarea value={communityDescription} onChange={(e) => setCommunityDescription(e.target.value)} maxLength={500} placeholder="О чём ваше сообщество?" rows={3} /></label>
+
+            <label>
+              {"\u0422\u0438\u043f \u0441\u043e\u043e\u0431\u0449\u0435\u0441\u0442\u0432\u0430"}
+              <select
+                value={communityVisibility}
+                onChange={(event) => setCommunityVisibility(event.target.value as "public" | "private")}
+              >
+                <option value="public">{"\u041f\u0443\u0431\u043b\u0438\u0447\u043d\u043e\u0435 \u2014 \u0441\u0432\u043e\u0431\u043e\u0434\u043d\u043e\u0435 \u0432\u0441\u0442\u0443\u043f\u043b\u0435\u043d\u0438\u0435"}</option>
+                <option value="private">{"\u041f\u0440\u0438\u0432\u0430\u0442\u043d\u043e\u0435 \u2014 \u0442\u043e\u043b\u044c\u043a\u043e \u043f\u043e \u043f\u0440\u0438\u0433\u043b\u0430\u0448\u0435\u043d\u0438\u044e"}</option>
+              </select>
+            </label>
+            <button className="wide-primary" type="submit" disabled={loading}>{loading ? "Создаём..." : "Создать сообщество"}</button>
+          </form>
+        </div>
+      )}
+
+      {showCreateChannel && (
+        <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) setShowCreateChannel(false); }}>
+          <form className="comind-modal" onSubmit={createChannel}>
+            <button type="button" className="modal-close" onClick={() => setShowCreateChannel(false)}>×</button>
+            <span className="eyebrow">НАСТРОЙКА СООБЩЕСТВА</span>
+            <h2>Новый канал</h2>
+            <p>Канал будет создан в «{community?.name}». По текущим правилам backend это может сделать владелец сообщества.</p>
+            <label>Название канала<input autoFocus value={channelName} onChange={(e) => setChannelName(e.target.value)} maxLength={50} required placeholder="например, обсуждение" /></label>
+            <label>Доступ
+              <select value={channelVisibility} onChange={(e) => setChannelVisibility(e.target.value as "public" | "private")}>
+                <option value="public">Открытый — участники сообщества</option>
+                <option value="private">Закрытый — только приглашённые</option>
+              </select>
+            </label>
+            <button className="wide-primary" type="submit" disabled={loading}>{loading ? "Создаём..." : "Создать канал"}</button>
+          </form>
+        </div>
+      )}
+          {showCreateVoiceChannel && (
+        <div
+          className="modal-backdrop"
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget) setShowCreateVoiceChannel(false);
+          }}
+        >
+          <form className="comind-modal" onSubmit={createVoiceChannel}>
+            <button
+              type="button"
+              className="modal-close"
+              onClick={() => setShowCreateVoiceChannel(false)}
+            >×</button>
+
+            <span className="eyebrow">ГОЛОСОВЫЕ КАНАЛЫ</span>
+            <h2>Новая голосовая комната</h2>
+            <p>Комната будет создана в сообществе «{community?.name}».</p>
+
+            <label>
+              Название комнаты
+              <input
+                autoFocus
+                value={voiceChannelName}
+                onChange={(e) => setVoiceChannelName(e.target.value)}
+                maxLength={50}
+                required
+                placeholder="Например, Общение"
+              />
+
+            </label>
+
+            <label>
+              {"\u0414\u043e\u0441\u0442\u0443\u043f \u043a \u0433\u043e\u043b\u043e\u0441\u043e\u0432\u043e\u0439 \u043a\u043e\u043c\u043d\u0430\u0442\u0435"}
+              <select value={voiceChannelVisibility} onChange={(event) => setVoiceChannelVisibility(event.target.value as "public" | "private")}>
+                <option value="public">{"\u041e\u0442\u043a\u0440\u044b\u0442\u0430\u044f \u2014 \u0432\u0441\u0435 \u0443\u0447\u0430\u0441\u0442\u043d\u0438\u043a\u0438"}</option>
+                <option value="private">{"\u041f\u0440\u0438\u0432\u0430\u0442\u043d\u0430\u044f \u2014 \u0442\u043e\u043b\u044c\u043a\u043e \u043f\u0440\u0438\u0433\u043b\u0430\u0448\u0451\u043d\u043d\u044b\u0435"}</option>
+              </select>
+            </label>
+
+            <button className="wide-primary" type="submit" disabled={loading}>
+              {loading ? "Создаём..." : "Создать комнату"}
+            </button>
+          </form>
+        </div>
+      )}
+
+      <button
+        className="feature-launcher"
+        onClick={() => setShowFeaturePanel(true)}
+      >
+        Все функции
+      </button>
+
+      {showFeaturePanel && (
+        <FeaturePanel
+          username={username}
+          communityId={community?.id ?? null}
+          channelId={channel?.id ?? null}
+          onClose={() => setShowFeaturePanel(false)}
+          onRefresh={() => {
+            void loadProfile();
+            void loadCommunities();
+            if (community) void loadChannels(community);
+          }}
+          onCommunityDeleted={() => {
+            setCommunity(null);
+            setChannel(null);
+            void loadCommunities();
+          }}
+        />
+      )}
+
+      <DirectMessages userId={userId} />
+
+</main>
+  );
+}
+
+

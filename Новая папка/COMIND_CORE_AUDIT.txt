@@ -1,0 +1,1726 @@
+COMIND SOON - CORE AUDIT
+Project: E:\COMIND_SOON_FOR_REVIEW_20261105_194130
+Date: 2026-11-10 17:04:02
+
+========== backend\app\main.py ==========
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from app.core.config import settings
+from app.core.database import init_db, init_chat_access
+from app.api.routes.auth import router as auth_router
+from app.api.routes.communities import router as communities_router
+from app.api.routes.channels import router as channels_router
+from app.api.routes.admin import router as admin_router
+from app.api.routes.voice import router as voice_router
+from app.api.routes.dm import router as dm_router, init_dm
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    init_extended()
+    init_chat_access()
+    init_dm()
+    yield
+
+
+app = FastAPI(
+    title=settings.APP_NAME,
+    description="API игровой социальной платформы",
+    version=settings.APP_VERSION,
+    debug=settings.DEBUG,
+    lifespan=lifespan,
+)
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "null",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "capacitor://localhost",
+        "http://localhost",
+    ],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(auth_router)
+app.include_router(communities_router)
+app.include_router(channels_router)
+app.include_router(admin_router)
+app.include_router(voice_router)
+app.include_router(dm_router)
+
+
+@app.get("/")
+def root():
+    return {
+        "message": settings.APP_NAME,
+        "status": "running",
+        "version": settings.APP_VERSION,
+    }
+
+
+@app.get("/api/health")
+def health_check():
+    return {"status": "ok", "service": "backend"}
+
+
+@app.get("/api/database/health")
+def database_health():
+    from app.core.database import get_db
+
+    with get_db() as connection:
+        connection.execute("SELECT 1").fetchone()
+
+    return {"status": "ok", "database": "sqlite"}
+
+
+from app.api.routes.extended import router as extended_router, init_extended
+app.include_router(extended_router)
+
+
+
+
+========== backend\app\core\database.py ==========
+import sqlite3
+from pathlib import Path
+from contextlib import contextmanager
+
+DATABASE_PATH = Path(__file__).resolve().parents[2] / "comind_soon.db"
+
+
+def get_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(DATABASE_PATH)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    return connection
+
+
+@contextmanager
+def get_db():
+    connection = get_connection()
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def init_db() -> None:
+    with get_db() as connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                email TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS communities (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                owner_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (owner_id) REFERENCES users(id)
+            )
+        """)
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS community_members (
+                community_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                role TEXT NOT NULL DEFAULT 'member',
+                joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (community_id, user_id),
+                FOREIGN KEY (community_id) REFERENCES communities(id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+                    ON DELETE CASCADE
+            )
+        """)
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                community_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                channel_type TEXT NOT NULL DEFAULT 'text',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (community_id) REFERENCES communities(id)
+                    ON DELETE CASCADE
+            )
+        """)
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (channel_id) REFERENCES channels(id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+
+
+def init_chat_access() -> None:
+    """Безопасная миграция доступа к чатам и администрирования."""
+    with get_db() as connection:
+        user_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(users)")
+        }
+        if "is_admin" not in user_columns:
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"
+            )
+
+        channel_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(channels)")
+        }
+        if "visibility" not in channel_columns:
+            connection.execute(
+                "ALTER TABLE channels ADD COLUMN visibility TEXT NOT NULL DEFAULT 'public'"
+            )
+
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS channel_members (
+                channel_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                joined_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (channel_id, user_id),
+                FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+        """)
+
+
+========== backend\app\core\security.py ==========
+from datetime import datetime, timedelta, timezone
+
+import jwt
+from pwdlib import PasswordHash
+
+from app.core.config import settings
+
+password_hash = PasswordHash.recommended()
+
+SECRET_KEY = settings.COMIND_SECRET_KEY
+
+if not SECRET_KEY:
+    raise RuntimeError(
+        "COMIND_SECRET_KEY не задан. Проверь файл backend/.env"
+    )
+
+ALGORITHM = "HS256"
+TOKEN_EXPIRE_MINUTES = 60
+
+
+def hash_password(password: str) -> str:
+    return password_hash.hash(password)
+
+
+def verify_password(password: str, hashed_password: str) -> bool:
+    return password_hash.verify(password, hashed_password)
+
+
+def create_access_token(user_id: int) -> str:
+    expires = datetime.now(timezone.utc) + timedelta(
+        minutes=TOKEN_EXPIRE_MINUTES
+    )
+    payload = {"sub": str(user_id), "exp": expires}
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def decode_access_token(token: str) -> dict:
+    return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+
+
+========== backend\app\api\routes\auth.py ==========
+import sqlite3
+
+import jwt
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+
+from app.core.database import get_db
+from app.core.security import (
+    create_access_token,
+    decode_access_token,
+    hash_password,
+    verify_password,
+)
+from app.schemas.auth import (
+    LoginRequest,
+    RegisterRequest,
+    TokenResponse,
+    UserResponse,
+)
+
+router = APIRouter(prefix="/api/auth", tags=["Authentication"])
+bearer = HTTPBearer(auto_error=False)
+
+
+def current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer),
+):
+    if credentials is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Требуется авторизация",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    try:
+        payload = decode_access_token(credentials.credentials)
+        user_id = int(payload["sub"])
+    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Недействительный или просроченный токен",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    with get_db() as connection:
+        user = connection.execute(
+            "SELECT id, username, email, created_at, COALESCE(is_admin, 0) AS is_admin FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+
+    if user is None:
+        raise HTTPException(status_code=401, detail="Пользователь не найден")
+
+    return dict(user)
+
+
+@router.post("/register", response_model=UserResponse, status_code=201)
+def register(data: RegisterRequest):
+    with get_db() as connection:
+        try:
+            cursor = connection.execute(
+                """
+                INSERT INTO users (username, email, password_hash)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    data.username,
+                    str(data.email).lower(),
+                    hash_password(data.password),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            raise HTTPException(
+                status_code=409,
+                detail="Имя пользователя или email уже заняты",
+            )
+
+        user = connection.execute(
+            "SELECT id, username, email, created_at, COALESCE(is_admin, 0) AS is_admin FROM users WHERE id = ?",
+            (cursor.lastrowid,),
+        ).fetchone()
+
+    return dict(user)
+
+
+@router.post("/login", response_model=TokenResponse)
+def login(data: LoginRequest):
+    with get_db() as connection:
+        user = connection.execute(
+            "SELECT id, email, password_hash FROM users WHERE email = ?",
+            (str(data.email).lower(),),
+        ).fetchone()
+
+    if user is None or not verify_password(data.password, user["password_hash"]):
+        raise HTTPException(
+            status_code=401,
+            detail="Неверный email или пароль",
+        )
+
+    return {
+        "access_token": create_access_token(user["id"]),
+        "token_type": "bearer",
+    }
+
+
+@router.get("/me", response_model=UserResponse)
+def me(user: dict = Depends(current_user)):
+    return user
+
+
+========== backend\app\api\routes\admin.py ==========
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
+
+from app.api.routes.auth import current_user
+from app.core.database import get_db
+
+router = APIRouter(prefix="/api/admin", tags=["Administration"])
+
+
+class AdminUpdate(BaseModel):
+    is_admin: bool
+
+
+def require_admin(user: dict) -> None:
+    if not bool(user.get("is_admin", 0)):
+        raise HTTPException(status_code=403, detail="Доступ только для администратора")
+
+
+@router.get("/users")
+def list_users(user: dict = Depends(current_user)):
+    require_admin(user)
+    with get_db() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, username, email, created_at,
+                   COALESCE(is_admin, 0) AS is_admin
+            FROM users
+            ORDER BY id
+            """
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+
+@router.patch("/users/{user_id}/admin")
+def update_admin(
+    user_id: int,
+    data: AdminUpdate,
+    user: dict = Depends(current_user),
+):
+    require_admin(user)
+
+    if user_id == user["id"] and not data.is_admin:
+        raise HTTPException(
+            status_code=400,
+            detail="Нельзя снять права администратора со своего аккаунта",
+        )
+
+    with get_db() as connection:
+        target = connection.execute(
+            "SELECT id FROM users WHERE id = ?",
+            (user_id,),
+        ).fetchone()
+
+        if target is None:
+            raise HTTPException(status_code=404, detail="Пользователь не найден")
+
+        connection.execute(
+            "UPDATE users SET is_admin = ? WHERE id = ?",
+            (1 if data.is_admin else 0, user_id),
+        )
+
+    return {"status": "updated", "user_id": user_id, "is_admin": data.is_admin}
+
+
+========== backend\app\api\routes\communities.py ==========
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+
+from app.api.routes.auth import current_user
+from app.core.database import get_db
+from app.schemas.community import CommunityCreate
+from app.services import community_service
+
+router = APIRouter(prefix="/api/communities", tags=["Communities"])
+
+@router.post("/", status_code=201)
+def create_community(
+    data: CommunityCreate,
+    user: dict = Depends(current_user),
+):
+    return community_service.create(
+        data.name,
+        data.description,
+        user["id"],
+        data.visibility,
+    )
+
+@router.get("/")
+def get_communities(user: dict = Depends(current_user)):
+    return community_service.get_all(user["id"])
+
+@router.get("/{community_id}")
+def get_community(
+    community_id: int,
+    user: dict = Depends(current_user),
+):
+    community = community_service.get_one(community_id)
+
+    if community is None:
+        raise HTTPException(404, "\u0421\u043e\u043e\u0431\u0449\u0435\u0441\u0442\u0432\u043e \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u043e")
+
+    if community.get("visibility", "public") == "private":
+        with get_db() as db:
+            membership = db.execute(
+                """
+                SELECT 1 FROM community_members
+                WHERE community_id=? AND user_id=?
+                """,
+                (community_id, user["id"]),
+            ).fetchone()
+
+        if not membership:
+            raise HTTPException(404, "\u0414\u043e\u0441\u0442\u0443\u043f \u0442\u043e\u043b\u044c\u043a\u043e \u0434\u043b\u044f \u0443\u0447\u0430\u0441\u0442\u043d\u0438\u043a\u043e\u0432 \u0441\u043e\u043e\u0431\u0449\u0435\u0441\u0442\u0432\u0430")
+
+    return community
+
+@router.post("/{community_id}/join")
+def join_community(
+    community_id: int,
+    user: dict = Depends(current_user),
+):
+    with get_db() as db:
+        community = db.execute(
+            "SELECT visibility FROM communities WHERE id=?",
+            (community_id,),
+        ).fetchone()
+
+        if community is None:
+            raise HTTPException(404, "\u0421\u043e\u043e\u0431\u0449\u0435\u0441\u0442\u0432\u043e \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u043e")
+
+        membership = db.execute(
+            """
+            SELECT 1 FROM community_members
+            WHERE community_id=? AND user_id=?
+            """,
+            (community_id, user["id"]),
+        ).fetchone()
+
+        if community["visibility"] == "private" and not membership:
+            raise HTTPException(404, "\u041f\u0440\u0438\u0432\u0430\u0442\u043d\u043e\u0435 \u0441\u043e\u043e\u0431\u0449\u0435\u0441\u0442\u0432\u043e: \u0442\u0440\u0435\u0431\u0443\u0435\u0442\u0441\u044f \u043f\u0440\u0438\u0433\u043b\u0430\u0448\u0435\u043d\u0438\u0435")
+
+    if not community_service.join(community_id, user["id"]):
+        raise HTTPException(404, "\u0421\u043e\u043e\u0431\u0449\u0435\u0441\u0442\u0432\u043e \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u043e")
+
+    return {"status": "joined", "community_id": community_id}
+
+@router.get("/{community_id}/members")
+def get_members(
+    community_id: int,
+    user: dict = Depends(current_user),
+):
+    community = community_service.get_one(community_id)
+
+    if community is None:
+        raise HTTPException(404, "\u0421\u043e\u043e\u0431\u0449\u0435\u0441\u0442\u0432\u043e \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d\u043e")
+
+    if community.get("visibility", "public") == "private":
+        with get_db() as db:
+            membership = db.execute(
+                """
+                SELECT 1 FROM community_members
+                WHERE community_id=? AND user_id=?
+                """,
+                (community_id, user["id"]),
+            ).fetchone()
+
+        if not membership:
+            raise HTTPException(404, "\u041f\u0440\u0438\u0432\u0430\u0442\u043d\u043e\u0435 \u0441\u043e\u043e\u0431\u0449\u0435\u0441\u0442\u0432\u043e")
+
+    return community_service.get_members(community_id)
+
+@router.delete("/{community_id}/leave")
+def leave_community(community_id: int, user: dict = Depends(current_user)):
+    with get_db() as db:
+        community = db.execute(
+            "SELECT id, owner_id FROM communities WHERE id=?",
+            (community_id,),
+        ).fetchone()
+        if community is None:
+            raise HTTPException(404, "Сообщество не найдено")
+
+        membership = db.execute(
+            "SELECT role FROM community_members WHERE community_id=? AND user_id=?",
+            (community_id, user["id"]),
+        ).fetchone()
+        if membership is None:
+            raise HTTPException(404, "Вы не состоите в этом сообществе")
+
+        is_owner = int(community["owner_id"]) == int(user["id"]) or membership["role"] == "owner"
+        new_owner_id = None
+        if is_owner:
+            successor = db.execute(
+                """
+                SELECT user_id
+                FROM community_members
+                WHERE community_id=? AND user_id<>?
+                ORDER BY
+                  CASE role WHEN 'admin' THEN 0 WHEN 'moderator' THEN 1 ELSE 2 END,
+                  joined_at ASC, user_id ASC
+                LIMIT 1
+                """,
+                (community_id, user["id"]),
+            ).fetchone()
+            if successor is None:
+                raise HTTPException(
+                    409,
+                    "Ты единственный участник. Удали сообщество, чтобы закрыть его, или пригласи другого участника и повтори выход.",
+                )
+
+            new_owner_id = int(successor["user_id"])
+            db.execute(
+                "UPDATE communities SET owner_id=? WHERE id=?",
+                (new_owner_id, community_id),
+            )
+            db.execute(
+                "UPDATE community_members SET role='member' WHERE community_id=? AND user_id=?",
+                (community_id, user["id"]),
+            )
+            db.execute(
+                "UPDATE community_members SET role='owner' WHERE community_id=? AND user_id=?",
+                (community_id, new_owner_id),
+            )
+
+        db.execute(
+            """
+            DELETE FROM channel_members
+            WHERE user_id=? AND channel_id IN (
+                SELECT id FROM channels WHERE community_id=?
+            )
+            """,
+            (user["id"], community_id),
+        )
+        db.execute(
+            """
+            DELETE FROM voice_signals
+            WHERE channel_id IN (SELECT id FROM channels WHERE community_id=?)
+              AND (sender_id=? OR receiver_id=?)
+            """,
+            (community_id, user["id"], user["id"]),
+        )
+        db.execute(
+            "DELETE FROM voice_presence WHERE community_id=? AND user_id=?",
+            (community_id, user["id"]),
+        )
+        db.execute(
+            "DELETE FROM community_members WHERE community_id=? AND user_id=?",
+            (community_id, user["id"]),
+        )
+
+        return {
+            "status": "left",
+            "community_id": community_id,
+            "new_owner_id": new_owner_id,
+        }
+
+
+========== frontend\src\App.tsx ==========
+import { useEffect, useState } from "react";
+import type { FormEvent } from "react";
+import "./App.css";
+import MainWindow from "./MainWindow";
+
+const API_URL = (
+  import.meta.env.VITE_API_URL || "http://127.0.0.1:8000"
+).replace(/\/$/, "");
+
+type User = {
+  id: number;
+  username: string;
+  email: string;
+  created_at: string;
+  is_admin?: boolean | number;
+};
+
+type Mode = "login" | "register";
+
+async function apiRequest<T>(
+  path: string,
+  options: RequestInit = {},
+): Promise<T> {
+  const response = await fetch(`${API_URL}${path}`, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...(options.headers || {}),
+    },
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const detail = data.detail;
+    const message = Array.isArray(detail)
+      ? detail.map((item: { msg?: string }) => item.msg || "").join(", ")
+      : typeof detail === "string"
+        ? detail
+        : `Ошибка сервера: ${response.status}`;
+
+    throw new Error(message || "Не удалось выполнить запрос");
+  }
+
+  return data as T;
+}
+
+export default function App() {
+  const [mode, setMode] = useState<Mode>("login");
+  const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [user, setUser] = useState<User | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [checkingSession, setCheckingSession] = useState(true);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function restoreSession() {
+      const token = localStorage.getItem("comind_access_token");
+
+      if (!token) {
+        if (!cancelled) setCheckingSession(false);
+        return;
+      }
+
+      try {
+        const profile = await apiRequest<User>("/api/auth/me", {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+
+        if (!cancelled) setUser(profile);
+      } catch {
+        localStorage.removeItem("comind_access_token");
+      } finally {
+        if (!cancelled) setCheckingSession(false);
+      }
+    }
+
+    void restoreSession();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  function changeMode(nextMode: Mode) {
+    setMode(nextMode);
+    setError("");
+    setNotice("");
+  }
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError("");
+    setNotice("");
+
+    const normalizedEmail = email.trim().toLowerCase();
+
+    if (mode === "register") {
+      if (!/^[a-zA-Z0-9_]{3,32}$/.test(username)) {
+        setError("Имя пользователя: 3–32 символа, только латинские буквы, цифры и _.");
+        return;
+      }
+
+      if (password.length < 8 || password.length > 128) {
+        setError("Пароль должен содержать от 8 до 128 символов.");
+        return;
+      }
+    }
+
+    setLoading(true);
+
+    try {
+      if (mode === "register") {
+        await apiRequest<User>("/api/auth/register", {
+          method: "POST",
+          body: JSON.stringify({
+            username: username.trim(),
+            email: normalizedEmail,
+            password,
+          }),
+        });
+      }
+
+      const tokenResponse = await apiRequest<{
+        access_token: string;
+        token_type: string;
+      }>("/api/auth/login", {
+        method: "POST",
+        body: JSON.stringify({
+          email: normalizedEmail,
+          password,
+        }),
+      });
+
+      localStorage.setItem("comind_access_token", tokenResponse.access_token);
+
+      const profile = await apiRequest<User>("/api/auth/me", {
+        headers: {
+          Authorization: `Bearer ${tokenResponse.access_token}`,
+        },
+      });
+
+      setUser(profile);
+      setPassword("");
+      setNotice("");
+    } catch (err) {
+      setError(
+        err instanceof TypeError
+          ? "Не удаётся подключиться к серверу. Проверь, запущен ли backend."
+          : err instanceof Error
+            ? err.message
+            : "Произошла ошибка.",
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function logout() {
+    localStorage.removeItem("comind_access_token");
+    setUser(null);
+    setPassword("");
+    setError("");
+    setNotice("Вы вышли из аккаунта.");
+    setMode("login");
+  }
+
+  if (checkingSession) {
+    return (
+      <main className="app-shell">
+        <div className="loading-card">
+          <div className="brand-mark">C</div>
+          <p>Подключение к COMIND…</p>
+        </div>
+      </main>
+    );
+  }
+
+  if (user) {
+    return <MainWindow username={user.username} userId={user.id} userIsAdmin={Boolean(user.is_admin)} onLogout={logout} />;
+  }
+
+  return (
+    <main className="app-shell">
+      <div className="ambient ambient-one" />
+      <div className="ambient ambient-two" />
+      <section className="auth-card">
+        <div className="brand">
+          <div className="brand-mark">C</div>
+          <span>COMIND</span>
+        </div>
+        <div className="auth-heading">
+          <p className="eyebrow">ТВОЁ ИГРОВОЕ СООБЩЕСТВО</p>
+          <h1>{mode === "login" ? "С возвращением" : "Создай аккаунт"}</h1>
+          <p className="subtitle">
+            {mode === "login" ? "Войди, чтобы продолжить." : "Присоединяйся к своему сообществу."}
+          </p>
+        </div>
+        <div className="mode-switch">
+          <button type="button" className={mode === "login" ? "mode-active" : ""} onClick={() => changeMode("login")}>
+            Вход
+          </button>
+          <button type="button" className={mode === "register" ? "mode-active" : ""} onClick={() => changeMode("register")}>
+            Регистрация
+          </button>
+        </div>
+        <form className="auth-form" onSubmit={handleSubmit}>
+          {mode === "register" && (
+            <label className="field">
+              <span>Имя пользователя</span>
+              <input type="text" placeholder="Например, player_01" value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" minLength={3} maxLength={32} required />
+            </label>
+          )}
+          <label className="field">
+            <span>Email</span>
+            <input type="email" placeholder="you@example.com" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" required />
+          </label>
+          <label className="field">
+            <span>Пароль</span>
+            <div className="password-wrapper">
+              <input type={showPassword ? "text" : "password"} placeholder={mode === "register" ? "Минимум 8 символов" : "Введи свой пароль"} value={password} onChange={(event) => setPassword(event.target.value)} autoComplete={mode === "login" ? "current-password" : "new-password"} minLength={mode === "register" ? 8 : 1} maxLength={128} required />
+              <button className="password-toggle" type="button" onClick={() => setShowPassword((value) => !value)} aria-label={showPassword ? "Скрыть пароль" : "Показать пароль"}>
+                {showPassword ? "Скрыть" : "Показать"}
+              </button>
+            </div>
+          </label>
+          {mode === "login" && <div className="form-extra"><span>Защищённое подключение</span></div>}
+          {error && <div className="message message-error" role="alert">{error}</div>}
+          {notice && <div className="message message-success">{notice}</div>}
+          <button className="primary-button" type="submit" disabled={loading}>
+            {loading ? "Подожди…" : mode === "login" ? "Войти в COMIND" : "Создать аккаунт"}
+          </button>
+        </form>
+        <p className="auth-footer">
+          {mode === "login" ? "Впервые здесь? " : "Уже есть аккаунт? "}
+          <button type="button" className="text-button" onClick={() => changeMode(mode === "login" ? "register" : "login")}>
+            {mode === "login" ? "Создать аккаунт" : "Войти"}
+          </button>
+        </p>
+      </section>
+      <p className="app-caption">COMIND · ТВОЁ ИГРОВОЕ СООБЩЕСТВО</p>
+    </main>
+  );
+}
+
+
+
+
+
+========== frontend\src\App.css ==========
+:root {
+  font-family: "Inter", sans-serif;
+  color: #f5f5fc;
+  background: #080910;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-optical-sizing: auto;
+  font-weight: 400;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+button, input { font: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: wait; opacity: 0.65; }
+
+.app-shell {
+  position: relative;
+  display: flex;
+  min-height: 100vh;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  padding: 32px 20px;
+  background: radial-gradient(ellipse at 50% 0%, #282052 0%, transparent 48%), #080910;
+}
+
+.ambient {
+  position: absolute;
+  width: 300px;
+  height: 300px;
+  border-radius: 50%;
+  filter: blur(100px);
+  opacity: 0.18;
+  pointer-events: none;
+}
+
+.ambient-one { top: 10%; left: 4%; background: #7549ff; }
+.ambient-two { right: 4%; bottom: 5%; background: #4334ca; }
+
+.auth-card, .dashboard-card, .loading-card {
+  position: relative;
+  z-index: 1;
+  width: 100%;
+  max-width: 440px;
+  border: 1px solid #ffffff12;
+  border-radius: 24px;
+  background: #11121bef;
+  box-shadow: 0 24px 90px #0007;
+}
+
+.auth-card { padding: 34px; }
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  font-size: 20px;
+  font-weight: 800;
+  letter-spacing: 2px;
+}
+
+.brand-mark {
+  display: grid;
+  width: 39px;
+  height: 39px;
+  flex-shrink: 0;
+  place-items: center;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #a78bfa, #6844ed);
+  box-shadow: 0 5px 24px #7954ff50;
+  color: white;
+  font-size: 23px;
+  font-weight: 800;
+}
+
+.auth-heading { margin: 35px 0 23px; }
+
+.eyebrow {
+  margin: 0 0 12px;
+  color: #a695ff;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.7px;
+}
+
+h1 {
+  margin: 0;
+  font-size: clamp(26px, 5vw, 32px);
+  font-weight: 700;
+  letter-spacing: -1.2px;
+}
+
+.subtitle {
+  margin: 11px 0 0;
+  color: #9595aa;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.mode-switch {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 5px;
+  margin-bottom: 23px;
+  padding: 5px;
+  border: 1px solid #ffffff08;
+  border-radius: 12px;
+  background: #090a12;
+}
+
+.mode-switch button {
+  padding: 11px 8px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #9999ad;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.mode-switch button.mode-active {
+  background: #29213f;
+  color: #d5c9ff;
+}
+
+.auth-form {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  color: #d9d8e6;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.field input {
+  width: 100%;
+  min-width: 0;
+  padding: 14px 15px;
+  border: 1px solid #ffffff13;
+  border-radius: 10px;
+  outline: none;
+  background: #0a0b13;
+  color: #f5f5fc;
+  font-size: 13px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.field input::placeholder { color: #606075; }
+
+.field input:focus {
+  border-color: #8c70f8;
+  box-shadow: 0 0 0 3px #8c70f81b;
+}
+
+.password-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding-right: 12px;
+  border: 1px solid #ffffff13;
+  border-radius: 10px;
+  background: #0a0b13;
+}
+
+.password-wrapper:focus-within {
+  border-color: #8c70f8;
+  box-shadow: 0 0 0 3px #8c70f81b;
+}
+
+.password-wrapper input {
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.password-wrapper input:focus {
+  border: 0;
+  box-shadow: none;
+}
+
+.password-toggle {
+  padding: 7px 0;
+  border: 0;
+  background: transparent;
+  color: #a99aff;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.form-extra {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: -8px;
+  color: #7f7f94;
+  font-size: 10px;
+}
+
+.primary-button {
+  width: 100%;
+  min-height: 48px;
+  padding: 13px 16px;
+  border: 0;
+  border-radius: 10px;
+  background: linear-gradient(105deg, #8055f5, #6741dc);
+  box-shadow: 0 8px 24px #7148e52b;
+  color: white;
+  font-size: 13px;
+  font-weight: 700;
+  transition: filter 0.2s, transform 0.2s;
+}
+
+.primary-button:hover:not(:disabled) {
+  filter: brightness(1.12);
+  transform: translateY(-1px);
+}
+
+.message {
+  padding: 12px;
+  border-radius: 9px;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.message-error {
+  border: 1px solid #f8717133;
+  background: #7f1d1d20;
+  color: #ffaaaa;
+}
+
+.message-success {
+  border: 1px solid #4ade8033;
+  background: #16653420;
+  color: #9ae6b4;
+}
+
+.auth-footer {
+  margin: 24px 0 0;
+  color: #88889c;
+  font-size: 11px;
+  text-align: center;
+}
+
+.text-button {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #b2a0ff;
+  font-size: inherit;
+  font-weight: 600;
+}
+
+.app-caption {
+  position: absolute;
+  bottom: 12px;
+  color: #606075;
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  text-align: center;
+}
+
+.dashboard-card { padding: 30px; }
+.dashboard-content { margin-top: 42px; }
+.dashboard-content h1 { overflow-wrap: anywhere; }
+
+.success-icon {
+  display: grid;
+  width: 46px;
+  height: 46px;
+  margin-bottom: 24px;
+  place-items: center;
+  border: 1px solid #4ade8035;
+  border-radius: 15px;
+  background: #16653425;
+  color: #86efac;
+  font-size: 25px;
+}
+
+.profile-info {
+  display: grid;
+  gap: 9px;
+  margin: 26px 0 20px;
+  padding: 18px;
+  border: 1px solid #ffffff10;
+  border-radius: 12px;
+  background: #090a12;
+}
+
+.profile-info span { color: #88889c; font-size: 11px; }
+
+.profile-info strong {
+  margin-bottom: 9px;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.profile-info strong:last-child { margin-bottom: 0; }
+
+.status-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 22px;
+  color: #9ae6b4;
+  font-size: 11px;
+}
+
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #4ade80;
+}
+
+.loading-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 24px;
+}
+
+.loading-card p { color: #b4b3c5; font-size: 13px; }
+
+@media (max-width: 480px) {
+  .app-shell { padding: 20px 14px 36px; }
+
+  .auth-card, .dashboard-card {
+    padding: 25px 21px;
+    border-radius: 19px;
+  }
+
+  .auth-heading { margin-top: 29px; }
+}
+
+
+
+
+========== frontend\src\index.css ==========
+:root {
+  font-family: Inter, "Segoe UI", Arial, sans-serif;
+  color: #f5f5fc;
+  background: #080910;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-weight: 400;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-width: 320px;
+  min-height: 100%;
+  background: #080910;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+#root {
+  width: 100%;
+  min-height: 100vh;
+  min-height: 100dvh;
+  margin: 0;
+  border: 0;
+  text-align: left;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+}
+
+input {
+  color-scheme: dark;
+}
+
+::selection {
+  color: #ffffff;
+  background: #7652df;
+}
+
+:focus-visible {
+  outline: 2px solid #a78bfa;
+  outline-offset: 3px;
+}
+
+
+========== frontend\src\api.ts ==========
+const API_URL = (
+  import.meta.env.VITE_API_URL || "http://127.0.0.1:8000"
+).replace(/\/+$/, "");
+
+export type ApiRecord = {
+  id: number;
+  [key: string]: unknown;
+};
+
+export type Community = ApiRecord & {
+  name: string;
+  description?: string | null;
+  member_count?: number;
+};
+
+export type Channel = ApiRecord & {
+  name: string;
+  channel_type?: string;
+  community_id?: number;
+};
+
+export type Message = ApiRecord & {
+  content: string;
+  user_id?: number;
+  username?: string;
+  created_at?: string;
+  edited_at?: string | null;
+};
+
+export type Profile = {
+  id: number;
+  username: string;
+  email: string;
+  display_name: string;
+  avatar_url: string;
+  bio: string;
+  status: "online" | "away" | "busy" | "offline";
+  created_at?: string;
+};
+
+export type CommunityMember = {
+  user_id: number;
+  username: string;
+  display_name: string;
+  avatar_url: string;
+  status: string;
+  role: "owner" | "admin" | "moderator" | "member";
+  joined_at?: string;
+};
+
+export type Notification = {
+  id: number;
+  title: string;
+  body: string;
+  is_read: number;
+  created_at: string;
+};
+
+export type SearchResults = {
+  communities: Community[];
+  users: Array<{
+    id: number;
+    username: string;
+    display_name: string;
+    avatar_url: string;
+  }>;
+  messages: Message[];
+};
+
+export type Report = {
+  id: number;
+  reporter_id: number;
+  target_user_id: number | null;
+  message_id: number | null;
+  reason: string;
+  status: string;
+  resolution?: string;
+  created_at: string;
+};
+
+async function request<T>(
+  path: string,
+  options: RequestInit = {},
+): Promise<T> {
+  const headers = new Headers(options.headers);
+  headers.set("Accept", "application/json");
+
+  if (options.body !== undefined && options.body !== null) {
+    headers.set("Content-Type", "application/json");
+  }
+
+  const token = localStorage.getItem("comind_access_token");
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+
+  let response: Response;
+
+  try {
+    response = await fetch(`${API_URL}${path}`, {
+      ...options,
+      headers,
+    });
+  } catch {
+    throw new Error(
+      `Не удалось подключиться к COMIND API (${API_URL}). Проверь backend.`,
+    );
+  }
+
+  if (response.status === 204) return undefined as T;
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const detail = (data as { detail?: unknown })?.detail;
+    const message = Array.isArray(detail)
+      ? detail.map((item: { msg?: string }) => item.msg || "").filter(Boolean).join("; ")
+      : typeof detail === "string"
+        ? detail
+        : `Ошибка HTTP ${response.status}`;
+
+    if (response.status === 401) {
+      throw new Error("Сессия истекла. Войди в аккаунт заново.");
+    }
+
+    throw new Error(message);
+  }
+
+  return data as T;
+}
+
+function list<T>(value: unknown, label: string): T[] {
+  if (Array.isArray(value)) return value as T[];
+
+  if (value && typeof value === "object") {
+    const obj = value as { items?: unknown; results?: unknown };
+    if (Array.isArray(obj.items)) return obj.items as T[];
+    if (Array.isArray(obj.results)) return obj.results as T[];
+  }
+
+  throw new Error(`Неожиданный формат ответа API: ${label}`);
+}
+
+function body(data: unknown): string {
+  return JSON.stringify(data);
+}
+
+export const api = {
+  // Сообщества
+  async getCommunities(): Promise<Community[]> {
+    return list(await request("/api/communities/"), "communities");
+  },
+
+  getCommunity(id: number): Promise<Community> {
+    return request(`/api/communities/${id}`);
+  },
+
+  createCommunity(data: { name: string; description: string }): Promise<Community> {
+    return request("/api/communities/", {
+      method: "POST",
+      body: body(data),
+    });
+  },
+
+  joinCommunity(id: number) {
+    return request<{ status: string; community_id: number }>(
+      `/api/communities/${id}/join`,
+      { method: "POST" },
+    );
+  },
+
+  updateCommunity(id: number, data: { name: string; description: string }) {
+    return request<Community>(`/api/communities/${id}`, {
+      method: "PATCH",
+      body: body(data),
+    });
+  },
+
+  deleteCommunity(id: number) {
+    return request<{ status: string; community_id: number }>(
+      `/api/communities/${id}`,
+      { method: "DELETE" },
+    );
+  },
+
+  async getMembers(id: number): Promise<CommunityMember[]> {
+    return list(await request(`/api/communities/${id}/members`), "members");
+  },
+
+  setMemberRole(
+    communityId: number,
+    userId: number,
+    role: "admin" | "moderator" | "member",
+  ) {
+    return request(`/api/communities/${communityId}/members/${userId}`, {
+      method: "PATCH",
+      body: body({ role }),
+    });
+  },
+
+  // Текстовые и голосовые каналы
+  async getChannels(communityId: number): Promise<Channel[]> {
+    return list(
+      await request(`/api/communities/${communityId}/channels`),
+      "channels",
+    );
+  },
+
+  createChannel(communityId: number, name: string): Promise<Channel> {
+    return request(`/api/communities/${communityId}/channels`, {
+      method: "POST",
+      body: body({ name }),
+    });
+  },
+
+  createVoiceChannel(communityId: number, name: string): Promise<Channel> {
+    return request(`/api/communities/${communityId}/voice-channels`, {
+      method: "POST",
+      body: body({ name }),
+    });
+  },
+
+  renameChannel(id: number, name: string) {
+    return request(`/api/channels/${id}`, {
+      method: "PATCH",
+      body: body({ name }),
+    });
+  },
+
+  deleteChannel(id: number) {
+    return request(`/api/channels/${id}`, { method: "DELETE" });
+  },
+
+  // Сообщения
+  async getMessages(channelId: number, limit = 50): Promise<Message[]> {
+    return list(
+      await request(`/api/channels/${channelId}/messages?limit=${limit}`),
+      "messages",
+    );
+  },
+
+  sendMessage(channelId: number, content: string): Promise<Message> {
+    return request(`/api/channels/${channelId}/messages`, {
+      method: "POST",
+      body: body({ content }),
+    });
+  },
+
+  editMessage(id: number, content: string) {
+    return request(`/api/messages/${id}`, {
+      method: "PATCH",
+      body: body({ content }),
+    });
+  },
+
+  deleteMessage(id: number) {
+    return request(`/api/messages/${id}`, { method: "DELETE" });
+  },
+
+  // Профиль пользователя
+  getProfile(): Promise<Profile> {
+    return request("/api/profile/me");
+  },
+
+  updateProfile(data: Partial<Pick<
+    Profile,
+    "display_name" | "bio" | "avatar_url" | "status"
+  >>) {
+    return request<Profile>("/api/profile/me", {
+      method: "PATCH",
+      body: body(data),
+    });
+  },
+
+  // Поиск
+  search(query: string): Promise<SearchResults> {
+    return request(`/api/search?q=${encodeURIComponent(query)}`);
+  },
+
+  // Уведомления
+  getNotifications(limit = 50) {
+    return request<{ items: Notification[]; unread: number }>(
+      `/api/notifications?limit=${limit}`,
+    );
+  },
+
+  readNotification(id: number) {
+    return request(`/api/notifications/${id}/read`, { method: "POST" });
+  },
+
+  readAllNotifications() {
+    return request("/api/notifications/read-all", { method: "POST" });
+  },
+
+  // Жалобы и модерация
+  createReport(data: {
+    target_user_id?: number;
+    message_id?: number;
+    reason: string;
+  }) {
+    return request<Report>("/api/reports", {
+      method: "POST",
+      body: body(data),
+    });
+  },
+
+  getReports() {
+    return request<Report[]>("/api/moderation/reports");
+  },
+
+  resolveReport(
+    id: number,
+    status: "resolved" | "rejected",
+    resolution: string,
+  ) {
+    return request(`/api/moderation/reports/${id}/resolve`, {
+      method: "POST",
+      body: body({ status, resolution }),
+    });
+  },
+
+  blockUser(userId: number, reason = "", communityId?: number) {
+    const query = communityId === undefined
+      ? ""
+      : `?community_id=${communityId}`;
+
+    return request(`/api/moderation/users/${userId}/block${query}`, {
+      method: "POST",
+      body: body({ reason }),
+    });
+  },
+
+  getModerationLog(communityId?: number) {
+    const query = communityId === undefined
+      ? ""
+      : `?community_id=${communityId}`;
+
+    return request(`/api/moderation/log${query}`);
+  },
+
+  // Голосовые комнаты: управление участием и сигналами
+  joinVoice(channelId: number) {
+    return request(`/api/voice/${channelId}/join`, { method: "POST" });
+  },
+
+  leaveVoice(channelId: number) {
+    return request(`/api/voice/${channelId}/leave`, { method: "POST" });
+  },
+
+  getVoicePresence(channelId: number) {
+    return request(`/api/voice/${channelId}/presence`);
+  },
+
+  muteVoice(channelId: number, muted: boolean) {
+    return request(`/api/voice/${channelId}/mute`, {
+      method: "PATCH",
+      body: body({ muted }),
+    });
+  },
+
+  sendVoiceSignal(
+    channelId: number,
+    receiverId: number,
+    signal: Record<string, unknown>,
+  ) {
+    return request(`/api/voice/${channelId}/signal`, {
+      method: "POST",
+      body: body({
+        receiver_id: receiverId,
+        payload: JSON.stringify(signal),
+      }),
+    });
+  },
+
+  getVoiceSignals(channelId: number) {
+    return request<Array<{
+      id: number;
+      sender_id: number;
+      receiver_id: number;
+      payload: string;
+    }>>(`/api/voice/${channelId}/signals`);
+  },
+
+  // Проверка backend
+  health() {
+    return request<{ status: string; service?: string }>("/api/health");
+  },
+
+  featureHealth() {
+    return request<{
+      status: string;
+      features: string[];
+      voice_media: string;
+    }>("/api/health/features");
+  },
+};
+
+export { API_URL };
+
+
+========== BACKEND STRUCTURE ==========
+backend\app\config.py | 230 bytes
+backend\app\main.py | 2021 bytes
+backend\app\main.py.backup_20261029_170837 | 1668 bytes
+backend\app\__init__.py | 5 bytes
+backend\app\api\__init__.py | 5 bytes
+backend\app\api\routes\admin.py | 1834 bytes
+backend\app\api\routes\auth.py | 3339 bytes
+backend\app\api\routes\channels.py | 8801 bytes
+backend\app\api\routes\channels.py.bak | 3699 bytes
+backend\app\api\routes\communities.py | 7354 bytes
+backend\app\api\routes\dm.py | 17589 bytes
+backend\app\api\routes\extended.py | 49780 bytes
+backend\app\api\routes\extended.py.backup_20261029_170837 | 25358 bytes
+backend\app\api\routes\voice.py | 5058 bytes
+backend\app\api\routes\__init__.py | 5 bytes
+backend\app\core\config.py | 469 bytes
+backend\app\core\database.py | 4290 bytes
+backend\app\core\security.py | 984 bytes
+backend\app\core\__init__.py | 5 bytes
+backend\app\repositories\channel_repository.py | 7716 bytes
+backend\app\repositories\channel_repository.py.bak | 4016 bytes
+backend\app\repositories\community_repository.py | 4141 bytes
+backend\app\schemas\auth.py | 569 bytes
+backend\app\schemas\channel.py | 352 bytes
+backend\app\schemas\community.py | 521 bytes
+backend\app\schemas\__init__.py | 5 bytes
+backend\app\services\channel_service.py | 707 bytes
+backend\app\services\community_service.py | 711 bytes

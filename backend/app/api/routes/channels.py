@@ -1,0 +1,233 @@
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
+
+from app.api.routes.auth import current_user
+from app.core.database import get_db
+from app.repositories import channel_repository as repo
+from app.schemas.channel import ChannelCreate, MessageCreate
+from app.services import channel_service
+
+router = APIRouter(tags=["Channels and Messages"])
+
+def is_admin(user: dict) -> bool:
+    return bool(user.get("is_admin", 0))
+
+def require_channel_access(
+    channel_id: int,
+    user: dict,
+    allow_public_visitor: bool = False,
+) -> dict:
+    channel = channel_service.get_channel(channel_id)
+
+    if channel is None:
+        raise HTTPException(404, "\u041a\u0430\u043d\u0430\u043b \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d")
+
+    if repo.can_access_channel(channel_id, user["id"], False):
+        return channel
+
+    if allow_public_visitor:
+        with get_db() as db:
+            community = db.execute(
+                "SELECT visibility FROM communities WHERE id=?",
+                (channel["community_id"],),
+            ).fetchone()
+
+        if (
+            community is not None
+            and community["visibility"] == "public"
+            and channel.get("visibility", "public") == "public"
+        ):
+            return channel
+
+    raise HTTPException(403, "\u041d\u0435\u0442 \u0434\u043e\u0441\u0442\u0443\u043f\u0430 \u043a \u044d\u0442\u043e\u043c\u0443 \u043a\u0430\u043d\u0430\u043b\u0443")
+
+@router.get("/api/communities/{community_id}/channels")
+def get_channels(community_id: int, user: dict = Depends(current_user)):
+    if not repo.community_exists(community_id):
+        raise HTTPException(404, "?????????? ?? ???????")
+
+    with get_db() as db:
+        community = db.execute(
+            "SELECT visibility FROM communities WHERE id=?",
+            (community_id,),
+        ).fetchone()
+
+    if community is None:
+        raise HTTPException(404, "?????????? ?? ???????")
+
+    is_member = repo.is_member(community_id, user["id"])
+
+    if community["visibility"] == "private" and not is_member:
+        raise HTTPException(404, "?????????? ?? ???????")
+
+    items = channel_service.get_channels(community_id)
+
+    if is_member:
+        return [
+            item for item in items
+            if repo.can_access_channel(item["id"], user["id"], False)
+        ]
+
+    # ??? ?????????? ?????????? ?????????? ?????
+    # ?????? ???????? ??????.
+    return [
+        item for item in items
+        if item.get("visibility", "public") == "public"
+    ]
+
+
+@router.post("/api/communities/{community_id}/channels", status_code=201)
+def create_channel(
+    community_id: int,
+    data: ChannelCreate,
+    user: dict = Depends(current_user),
+):
+    if not repo.community_exists(community_id):
+        raise HTTPException(status_code=404, detail="Сообщество не найдено")
+
+    if not repo.is_owner(community_id, user["id"]):
+        raise HTTPException(
+            status_code=403,
+            detail="Создавать каналы может только владелец сообщества или администратор",
+        )
+
+    try:
+        return channel_service.create_text_channel(
+            community_id,
+            data.name,
+            user["id"],
+            data.visibility,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error))
+
+@router.get("/api/channels/{channel_id}/messages")
+def get_messages(
+    channel_id: int,
+    limit: int = Query(default=50, ge=1, le=100),
+    user: dict = Depends(current_user),
+):
+    channel = require_channel_access(
+        channel_id,
+        user,
+        allow_public_visitor=True,
+    )
+
+    if channel["channel_type"] != "text":
+        raise HTTPException(
+            status_code=400,
+            detail="\u0418\u0441\u0442\u043e\u0440\u0438\u044f \u0434\u043e\u0441\u0442\u0443\u043f\u043d\u0430 \u0442\u043e\u043b\u044c\u043a\u043e \u0434\u043b\u044f \u0442\u0435\u043a\u0441\u0442\u043e\u0432\u044b\u0445 \u043a\u0430\u043d\u0430\u043b\u043e\u0432",
+        )
+
+    return channel_service.get_messages(channel_id, limit)
+
+@router.post("/api/channels/{channel_id}/messages", status_code=201)
+def send_message(
+    channel_id: int,
+    data: MessageCreate,
+    user: dict = Depends(current_user),
+):
+    channel = require_channel_access(channel_id, user)
+
+    if channel["channel_type"] != "text":
+        raise HTTPException(
+            status_code=400,
+            detail="\u041e\u0442\u043f\u0440\u0430\u0432\u043b\u044f\u0442\u044c \u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u044f \u043c\u043e\u0436\u043d\u043e \u0442\u043e\u043b\u044c\u043a\u043e \u0432 \u0442\u0435\u043a\u0441\u0442\u043e\u0432\u044b\u0435 \u043a\u0430\u043d\u0430\u043b\u044b",
+        )
+
+    if not repo.is_member(channel["community_id"], user["id"]):
+        raise HTTPException(403, "\u0421\u043d\u0430\u0447\u0430\u043b\u0430 \u0432\u0441\u0442\u0443\u043f\u0438\u0442\u0435 \u0432 \u0441\u043e\u043e\u0431\u0449\u0435\u0441\u0442\u0432\u043e")
+
+    content = data.content.strip()
+
+    if not content:
+        raise HTTPException(422, "\u0421\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435 \u043d\u0435 \u043c\u043e\u0436\u0435\u0442 \u0431\u044b\u0442\u044c \u043f\u0443\u0441\u0442\u044b\u043c")
+
+    return channel_service.send_message(channel_id, user["id"], content)
+
+@router.put("/api/messages/{message_id}")
+def edit_message(
+    message_id: int,
+    data: MessageCreate,
+    user: dict = Depends(current_user),
+):
+    message = repo.get_message(message_id)
+    if message is None:
+        raise HTTPException(status_code=404, detail="Сообщение не найдено")
+
+    if not repo.is_member(message["community_id"], user["id"]):
+        raise HTTPException(404, detail="Message not found")
+
+    is_author = int(message["user_id"]) == int(user["id"])
+    is_owner = repo.is_owner(message["community_id"], user["id"])
+    is_admin = bool(user.get("is_admin", 0))
+
+    if not is_author and not is_owner and not is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="Редактировать сообщение может его автор, владелец сообщества или администратор",
+        )
+
+    content = data.content.strip()
+    if not content:
+        raise HTTPException(status_code=422, detail="Сообщение не может быть пустым")
+
+    updated = repo.update_message(message_id, content)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Сообщение не найдено")
+    return updated
+
+@router.delete("/api/messages/{message_id}")
+def delete_message(
+    message_id: int,
+    user: dict = Depends(current_user),
+):
+    message = repo.get_message(message_id)
+    if message is None:
+        raise HTTPException(status_code=404, detail="Сообщение не найдено")
+
+    if not repo.is_member(message["community_id"], user["id"]):
+        raise HTTPException(404, detail="Message not found")
+
+    is_author = message["user_id"] == user["id"]
+    is_owner = repo.is_owner(message["community_id"], user["id"])
+
+    if not is_author and not is_owner and not is_admin(user):
+        raise HTTPException(
+            status_code=403,
+            detail="Недостаточно прав для удаления сообщения",
+        )
+
+    repo.delete_message(message_id)
+    return {"status": "deleted", "message_id": message_id}
+
+class ChannelInvite(BaseModel):
+    username: str = Field(min_length=3, max_length=32, pattern=r"^[a-zA-Z0-9_]+$")
+
+@router.post("/api/channels/{channel_id}/members", status_code=201)
+def invite_channel_member(
+    channel_id: int,
+    data: ChannelInvite,
+    user: dict = Depends(current_user),
+):
+    channel = require_channel_access(channel_id, user)
+
+    if channel.get("visibility", "public") != "private":
+        raise HTTPException(
+            status_code=400,
+            detail="Приглашения нужны только для закрытого канала",
+        )
+
+    target = repo.find_community_member(channel["community_id"], data.username)
+    if target is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Пользователь не найден среди участников этого сообщества",
+        )
+
+    repo.add_channel_member(channel_id, target["id"])
+    return {
+        "status": "invited",
+        "username": target["username"],
+        "channel_id": channel_id,
+    }

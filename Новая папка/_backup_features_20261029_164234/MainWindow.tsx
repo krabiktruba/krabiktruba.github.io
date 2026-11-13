@@ -1,0 +1,501 @@
+﻿import { useCallback, useEffect, useState } from "react";
+import "./MainWindow.css";
+
+const API = (import.meta.env.VITE_API_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
+
+type AnyRecord = {
+  id: number;
+  [key: string]: any;
+};
+
+type Community = AnyRecord & {
+  name: string;
+  description?: string;
+  member_count?: number;
+};
+
+type Channel = AnyRecord & {
+  name: string;
+  channel_type?: string;
+};
+
+type Message = AnyRecord & {
+  content: string;
+  user_id?: number;
+  username?: string;
+  created_at?: string;
+};
+
+async function apiRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const headers = new Headers(options.headers);
+  headers.set("Accept", "application/json");
+
+  if (options.body) headers.set("Content-Type", "application/json");
+
+  const token = localStorage.getItem("comind_access_token");
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+
+  let response: Response;
+  try {
+    response = await fetch(`${API}${path}`, { ...options, headers });
+  } catch {
+    throw new Error("Backend недоступен. Запусти сервер COMIND на порту 8000.");
+  }
+
+  const data = response.status === 204 ? null : await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    const detail = (data as any)?.detail;
+    const message = Array.isArray(detail)
+      ? detail.map((x: any) => x.msg || "").join("; ")
+      : detail;
+    throw new Error(message || `Ошибка HTTP ${response.status}`);
+  }
+
+  return data as T;
+}
+
+function asArray<T>(value: any): T[] {
+  if (Array.isArray(value)) return value;
+  if (Array.isArray(value?.items)) return value.items;
+  if (Array.isArray(value?.results)) return value.results;
+  return [];
+}
+
+export default function MainWindow({
+  username,
+  onLogout,
+}: {
+  username: string;
+  onLogout: () => void;
+}) {
+  const [communities, setCommunities] = useState<Community[]>([]);
+  const [community, setCommunity] = useState<Community | null>(null);
+  const [channels, setChannels] = useState<Channel[]>([]);
+  const [channel, setChannel] = useState<Channel | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [messageText, setMessageText] = useState("");
+  const [search, setSearch] = useState("");
+  const [communityName, setCommunityName] = useState("");
+  const [communityDescription, setCommunityDescription] = useState("");
+  const [channelName, setChannelName] = useState("");
+  const [showCreateCommunity, setShowCreateCommunity] = useState(false);
+  const [showCreateChannel, setShowCreateChannel] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [noticeError, setNoticeError] = useState(false);
+
+  const notify = (text: string, isError = false) => {
+    setNotice(text);
+    setNoticeError(isError);
+  };
+
+  const loadCommunities = useCallback(async () => {
+    try {
+      const result = await apiRequest<any>("/api/communities/");
+      setCommunities(asArray<Community>(result));
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Не удалось загрузить сообщества", true);
+    }
+  }, []);
+
+  const loadChannels = useCallback(async (selected: Community) => {
+    setCommunity(selected);
+    setChannel(null);
+    setChannels([]);
+    setMessages([]);
+    try {
+      const result = await apiRequest<any>(
+        `/api/communities/${selected.id}/channels`,
+      );
+      const items = asArray<Channel>(result);
+      setChannels(items);
+      if (items.length) setChannel(items[0]);
+      else notify("В сообществе пока нет каналов.");
+    } catch (error) {
+      const text = error instanceof Error ? error.message : "Не удалось загрузить каналы";
+      if (text.includes("403") || text.toLowerCase().includes("вступите")) {
+        notify("Сначала вступи в сообщество.", true);
+      } else {
+        notify(text, true);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadCommunities();
+  }, [loadCommunities]);
+
+  useEffect(() => {
+    if (!channel) {
+      setMessages([]);
+      return;
+    }
+
+    let active = true;
+
+    const loadMessages = async () => {
+      try {
+        const result = await apiRequest<any>(
+          `/api/channels/${channel.id}/messages?limit=100`,
+        );
+        if (active) setMessages(asArray<Message>(result));
+      } catch (error) {
+        if (active) {
+          setMessages([]);
+          notify(error instanceof Error ? error.message : "Не удалось загрузить сообщения", true);
+        }
+      }
+    };
+
+    void loadMessages();
+    const interval = window.setInterval(() => void loadMessages(), 5000);
+
+    return () => {
+      active = false;
+      window.clearInterval(interval);
+    };
+  }, [channel]);
+
+  async function chooseCommunity(item: Community) {
+    setLoading(true);
+    setNotice("");
+    try {
+      await loadChannels(item);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function joinCommunity(item: Community) {
+    setLoading(true);
+    try {
+      await apiRequest(`/api/communities/${item.id}/join`, { method: "POST" });
+      notify(`Ты вступил в «${item.name}».`);
+      await loadChannels(item);
+      await loadCommunities();
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Не удалось вступить", true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function createCommunity(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!communityName.trim()) return;
+
+    setLoading(true);
+    try {
+      const created = await apiRequest<Community>("/api/communities/", {
+        method: "POST",
+        body: JSON.stringify({
+          name: communityName.trim(),
+          description: communityDescription.trim(),
+        }),
+      });
+
+      setShowCreateCommunity(false);
+      setCommunityName("");
+      setCommunityDescription("");
+      await loadCommunities();
+      notify("Сообщество создано.");
+      if (created?.id) await loadChannels(created);
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Не удалось создать сообщество", true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function createChannel(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!community || !channelName.trim()) return;
+
+    setLoading(true);
+    try {
+      await apiRequest(`/api/communities/${community.id}/channels`, {
+        method: "POST",
+        body: JSON.stringify({ name: channelName.trim() }),
+      });
+      setChannelName("");
+      setShowCreateChannel(false);
+      const updated = await apiRequest<any>(
+        `/api/communities/${community.id}/channels`,
+      );
+      const items = asArray<Channel>(updated);
+      setChannels(items);
+      if (items.length) setChannel(items[items.length - 1]);
+      notify("Канал создан.");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Не удалось создать канал", true);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function sendMessage(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!channel || !messageText.trim()) return;
+
+    const content = messageText.trim();
+    setMessageText("");
+
+    try {
+      const sent = await apiRequest<Message>(
+        `/api/channels/${channel.id}/messages`,
+        {
+          method: "POST",
+          body: JSON.stringify({ content }),
+        },
+      );
+      setMessages((previous) => [...previous, sent]);
+    } catch (error) {
+      setMessageText(content);
+      notify(error instanceof Error ? error.message : "Сообщение не отправлено", true);
+    }
+  }
+
+  async function deleteMessage(item: Message) {
+    if (!window.confirm("Удалить это сообщение?")) return;
+    try {
+      await apiRequest(`/api/messages/${item.id}`, { method: "DELETE" });
+      setMessages((previous) => previous.filter((message) => message.id !== item.id));
+      notify("Сообщение удалено.");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Не удалось удалить сообщение", true);
+    }
+  }
+
+  const filtered = communities.filter((item) =>
+    `${item.name} ${item.description || ""}`.toLowerCase().includes(search.toLowerCase()),
+  );
+
+  return (
+    <main className="comind">
+      <aside className="comind-rail">
+        <div className="comind-logo">C<span>.</span></div>
+        <button className="rail-home active" title="Сообщества" onClick={() => {
+          setCommunity(null);
+          setChannel(null);
+        }}>⌂</button>
+        <div className="rail-divider" />
+        {communities.slice(0, 8).map((item) => (
+          <button
+            key={item.id}
+            className={`rail-community ${community?.id === item.id ? "selected" : ""}`}
+            title={item.name}
+            onClick={() => void chooseCommunity(item)}
+          >
+            {(item.name || "?").slice(0, 2).toUpperCase()}
+          </button>
+        ))}
+        <button className="rail-add" title="Создать сообщество" onClick={() => setShowCreateCommunity(true)}>＋</button>
+        <div className="rail-spacer" />
+        <button className="rail-profile" title={username}>{(username || "U").slice(0, 1).toUpperCase()}</button>
+      </aside>
+
+      <aside className="comind-sidebar">
+        <header className="sidebar-header">
+          <div>
+            <div className="eyebrow">GAMING COMMUNITY</div>
+            <h1>COMIND<span> SOON</span></h1>
+          </div>
+          <button className="icon-button" title="Обновить" onClick={() => void loadCommunities()}>↻</button>
+        </header>
+
+        <div className="user-card">
+          <div className="user-avatar">{(username || "U").slice(0, 1).toUpperCase()}</div>
+          <div className="user-info">
+            <strong>{username}</strong>
+            <span><i className="online-dot" /> В сети</span>
+          </div>
+          <button className="icon-button" title="Выйти" onClick={onLogout}>⇥</button>
+        </div>
+
+        <div className="sidebar-section-title">
+          <span>СООБЩЕСТВА</span>
+          <button className="tiny-add" title="Создать сообщество" onClick={() => setShowCreateCommunity(true)}>＋</button>
+        </div>
+
+        <label className="search-box">
+          <span>⌕</span>
+          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Найти сообщество..." />
+        </label>
+
+        <div className="community-list">
+          {filtered.map((item) => (
+            <div key={item.id} className={`community-entry ${community?.id === item.id ? "current" : ""}`}>
+              <button className="community-select" onClick={() => void chooseCommunity(item)}>
+                <span className="community-avatar">{item.name.slice(0, 1).toUpperCase()}</span>
+                <span className="community-copy">
+                  <strong>{item.name}</strong>
+                  <small>{item.member_count ?? 0} участников</small>
+                </span>
+              </button>
+              <button className="join-button" title="Вступить" onClick={() => void joinCommunity(item)}>↗</button>
+            </div>
+          ))}
+          {!filtered.length && <p className="empty-small">Сообществ пока нет. Создай первое.</p>}
+        </div>
+
+        <div className="sidebar-footer">
+          <span className="status-led" /> API CLIENT
+          <span className="version">EARLY ACCESS</span>
+        </div>
+      </aside>
+
+      <section className="comind-workspace">
+        {notice && (
+          <div className={`notice ${noticeError ? "notice-error" : ""}`}>
+            <span>{notice}</span>
+            <button onClick={() => setNotice("")}>×</button>
+          </div>
+        )}
+
+        {community ? (
+          <>
+            <header className="workspace-header">
+              <div className="workspace-community-icon">{community.name.slice(0, 1).toUpperCase()}</div>
+              <div className="workspace-title">
+                <h2>{community.name}</h2>
+                <p>{community.description || "Игровое сообщество COMIND"}</p>
+              </div>
+              <div className="header-actions">
+                <span className="connection-pill"><i /> LIVE API</span>
+                <button className="secondary-button" onClick={() => void joinCommunity(community)}>Вступить / обновить доступ</button>
+              </div>
+            </header>
+
+            <div className="workspace-body">
+              <aside className="channel-sidebar">
+                <div className="channel-heading">
+                  <span>КАНАЛЫ</span>
+                  <button className="tiny-add" title="Создать канал" onClick={() => setShowCreateChannel(true)}>＋</button>
+                </div>
+                {channels.map((item) => (
+                  <button
+                    key={item.id}
+                    className={`channel-item ${channel?.id === item.id ? "active" : ""}`}
+                    onClick={() => setChannel(item)}
+                  >
+                    <span className="channel-symbol">{item.channel_type === "voice" ? "◖" : "#"}</span>
+                    <span>{item.name}</span>
+                  </button>
+                ))}
+                {!channels.length && <p className="empty-small">Нет доступных каналов.</p>}
+                <div className="channel-bottom">
+                  <div className="channel-heading">ГОЛОС И ВИДЕО</div>
+                  <div className="feature-placeholder"><span>◖</span><div><b>Голосовые комнаты</b><small>Следующий этап</small></div></div>
+                  <div className="feature-placeholder"><span>▣</span><div><b>Демонстрация экрана</b><small>Следующий этап</small></div></div>
+                </div>
+              </aside>
+
+              <section className="chat-panel">
+                <header className="chat-header">
+                  <div className="chat-hash">#</div>
+                  <div><h3>{channel?.name || "Выбери канал"}</h3><p>Сообщения сообщества</p></div>
+                  <div className="chat-header-right"><span>{messages.length} сообщений</span><button className="icon-button" title="Обновить каналы" onClick={() => void loadChannels(community)}>↻</button></div>
+                </header>
+
+                <div className="message-list">
+                  {!channel && <div className="empty-state"><div className="empty-symbol">#</div><h3>Выбери канал</h3><p>Выбери канал слева, чтобы открыть переписку.</p></div>}
+                  {channel && messages.length === 0 && <div className="empty-state"><div className="empty-symbol">✳</div><h3>Начни общение</h3><p>Здесь пока нет сообщений. Напиши первым.</p></div>}
+                  {messages.map((item, index) => {
+                    const author = String(item.username || item.author_name || item.author || (item.user_id === undefined ? "Участник" : `Участник ${item.user_id}`));
+                    return (
+                      <article className="message" key={item.id ?? `${index}-${item.content}`}>
+                        <div className="message-avatar">{author.slice(0, 1).toUpperCase()}</div>
+                        <div className="message-body">
+                          <div className="message-meta">
+                            <strong>{author}</strong>
+                            <time>{item.created_at ? new Date(item.created_at).toLocaleString("ru-RU") : ""}</time>
+                          </div>
+                          <p>{item.content}</p>
+                        </div>
+                        <button className="message-delete" title="Удалить сообщение" onClick={() => void deleteMessage(item)}>×</button>
+                      </article>
+                    );
+                  })}
+                </div>
+
+                <form className="message-composer" onSubmit={sendMessage}>
+                  <button type="button" className="composer-plus" title="Дополнительные функции" onClick={() => notify("Вложения будут добавлены следующим этапом.")}>＋</button>
+                  <input
+                    value={messageText}
+                    onChange={(e) => setMessageText(e.target.value)}
+                    placeholder={channel ? `Написать в #${channel.name}` : "Сначала выбери канал"}
+                    disabled={!channel || loading}
+                    maxLength={4000}
+                  />
+                  <span className="composer-hint">Enter ↵</span>
+                  <button className="send-button" type="submit" disabled={!channel || !messageText.trim() || loading}>➤</button>
+                </form>
+                <div className="chat-footnote">Пожалуйста, соблюдай правила сообщества.</div>
+              </section>
+
+              <aside className="members-panel">
+                <div className="members-heading">СООБЩЕСТВО</div>
+                <div className="community-cover"><div className="cover-orb orb-one" /><div className="cover-orb orb-two" /><span>{community.name.slice(0, 1).toUpperCase()}</span></div>
+                <h3 className="member-community-name">{community.name}</h3>
+                <p className="member-description">{community.description || "Место для общения, игр и совместных проектов."}</p>
+                <div className="member-stat-row"><span>Участники</span><strong>{community.member_count ?? "—"}</strong></div>
+                <div className="member-stat-row"><span>Каналы</span><strong>{channels.length}</strong></div>
+                <div className="member-stat-row"><span>Соединение</span><strong className="green-text">API</strong></div>
+                <button className="wide-primary" onClick={() => void joinCommunity(community)} disabled={loading}>Вступить в сообщество</button>
+                <div className="next-features"><span>В РАЗРАБОТКЕ</span><p>Роли и права доступа</p><p>Голосовые комнаты</p><p>AI-помощник</p><p>Рейтинг и достижения</p></div>
+              </aside>
+            </div>
+          </>
+        ) : (
+          <div className="discover-view">
+            <header className="discover-top"><span className="connection-pill"><i /> COMIND PLATFORM</span><button className="secondary-button" onClick={() => void loadCommunities()}>↻ Обновить</button></header>
+            <div className="discover-content">
+              <div className="hero-label"><span /> ТВОЯ ИГРОВАЯ СРЕДА</div>
+              <h2>Играй вместе.<br /><span>Создавай сообщества.</span></h2>
+              <p className="hero-description">Единое пространство для игровых сообществ, общения и совместных проектов.</p>
+              <div className="discover-actions"><button className="primary-button" onClick={() => setShowCreateCommunity(true)}>＋ Создать сообщество</button><button className="secondary-button" onClick={() => document.getElementById("community-catalog")?.scrollIntoView({ behavior: "smooth" })}>Найти сообщество ↓</button></div>
+              <div className="feature-grid">
+                <div className="feature-card"><span className="feature-icon purple">⌘</span><h3>Свои сообщества</h3><p>Создавай пространства и собирай игроков.</p></div>
+                <div className="feature-card"><span className="feature-icon blue">#</span><h3>Общение</h3><p>Текстовые каналы и сообщения, подключённые к backend.</p></div>
+                <div className="feature-card"><span className="feature-icon pink">✧</span><h3>Развитие</h3><p>Роли, достижения, голос и AI — следующие модули.</p></div>
+              </div>
+              <div id="community-catalog" className="catalog-heading"><div><span className="eyebrow">ОТКРЫТЬ НОВОЕ</span><h3>Сообщества</h3></div><span>{filtered.length} найдено</span></div>
+              <div className="discover-community-grid">
+                {filtered.map((item) => <button key={item.id} className="discover-community-card" onClick={() => void chooseCommunity(item)}><div className="discover-card-icon">{item.name.slice(0, 1).toUpperCase()}</div><div><strong>{item.name}</strong><p>{item.description || "Игровое сообщество COMIND"}</p><small>{item.member_count ?? 0} участников</small></div><span className="card-arrow">↗</span></button>)}
+                {!filtered.length && <div className="catalog-empty">Сообщества не найдены. Создай своё или обнови список.</div>}
+              </div>
+            </div>
+          </div>
+        )}
+      </section>
+
+      {showCreateCommunity && (
+        <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) setShowCreateCommunity(false); }}>
+          <form className="comind-modal" onSubmit={createCommunity}>
+            <button type="button" className="modal-close" onClick={() => setShowCreateCommunity(false)}>×</button>
+            <span className="eyebrow">НОВОЕ ПРОСТРАНСТВО</span>
+            <h2>Создать сообщество</h2>
+            <p>Создай место для своей команды и сообщества.</p>
+            <label>Название<input autoFocus value={communityName} onChange={(e) => setCommunityName(e.target.value)} maxLength={80} required placeholder="Например, Minecraft Squad" /></label>
+            <label>Описание<textarea value={communityDescription} onChange={(e) => setCommunityDescription(e.target.value)} maxLength={500} placeholder="О чём ваше сообщество?" rows={3} /></label>
+            <button className="wide-primary" type="submit" disabled={loading}>{loading ? "Создаём..." : "Создать сообщество"}</button>
+          </form>
+        </div>
+      )}
+
+      {showCreateChannel && (
+        <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) setShowCreateChannel(false); }}>
+          <form className="comind-modal" onSubmit={createChannel}>
+            <button type="button" className="modal-close" onClick={() => setShowCreateChannel(false)}>×</button>
+            <span className="eyebrow">НАСТРОЙКА СООБЩЕСТВА</span>
+            <h2>Новый канал</h2>
+            <p>Канал будет создан в «{community?.name}». По текущим правилам backend это может сделать владелец сообщества.</p>
+            <label>Название канала<input autoFocus value={channelName} onChange={(e) => setChannelName(e.target.value)} maxLength={80} required placeholder="например, обсуждение" /></label>
+            <button className="wide-primary" type="submit" disabled={loading}>{loading ? "Создаём..." : "Создать канал"}</button>
+          </form>
+        </div>
+      )}
+    </main>
+  );
+}

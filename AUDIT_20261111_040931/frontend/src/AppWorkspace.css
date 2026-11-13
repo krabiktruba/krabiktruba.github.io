@@ -1,0 +1,109 @@
+﻿.app-workspace {
+  width:100%;
+  height:100vh;
+  height:100dvh;
+  min-height:0;
+  display:flex;
+  flex-direction:column;
+  overflow:hidden;
+  background:#090d18;
+  color:#e9ecf8;
+}
+.app-topbar {
+  height:66px;
+  min-height:66px;
+  display:flex;
+  align-items:center;
+  gap:35px;
+  padding:0 28px;
+  background:#0c111e;
+  border-bottom:1px solid #242b3d;
+  position:relative;
+  z-index:10;
+}
+.workspace-brand {
+  display:flex;
+  align-items:center;
+  gap:10px;
+  border:0;
+  background:transparent;
+  color:#f0edff;
+  font-size:14px;
+  font-weight:850;
+  letter-spacing:1px;
+  white-space:nowrap;
+}
+.workspace-brand-mark {
+  display:grid;
+  place-items:center;
+  width:34px;
+  height:34px;
+  border-radius:10px;
+  background:linear-gradient(135deg,#8f70ed,#3d5d9b);
+  font-size:21px;
+  letter-spacing:-2px;
+}
+.workspace-brand-mark span { color:#d4c8ff; }
+.workspace-brand i { color:#a58bff; font-style:normal; }
+.workspace-navigation { height:100%; display:flex; align-items:center; gap:5px; flex:1; }
+.workspace-nav-item {
+  height:100%;
+  padding:0 13px;
+  border:0;
+  border-bottom:2px solid transparent;
+  background:transparent;
+  color:#8d99b1;
+  font-size:12px;
+  white-space:nowrap;
+}
+.workspace-nav-item:hover,.workspace-nav-item.active {
+  color:#eeeaff;
+  border-bottom-color:#9a7cf3;
+}
+.workspace-account { display:flex; align-items:center; gap:9px; }
+.workspace-user {
+  display:flex;
+  align-items:center;
+  gap:9px;
+  padding:5px 9px 5px 5px;
+  border:1px solid transparent;
+  border-radius:9px;
+  background:transparent;
+  color:#cbd2e3;
+  font-size:11px;
+}
+.workspace-user.active,.workspace-user:hover { background:#171c2c; border-color:#33304b; }
+.workspace-user-avatar {
+  width:28px;
+  height:28px;
+  display:grid;
+  place-items:center;
+  border-radius:9px;
+  background:linear-gradient(135deg,#8060dc,#3c6596);
+  color:white;
+  font-weight:800;
+}
+.workspace-logout {
+  width:32px;
+  height:32px;
+  border:1px solid #2c3549;
+  border-radius:9px;
+  background:#151b29;
+  color:#a7b2c8;
+}
+.workspace-logout:hover { border-color:#8b70df; color:white; }
+.app-workspace-body { flex:1; min-height:0; overflow:hidden; }
+.legacy-community-view { width:100%; height:100%; min-height:0; }
+.legacy-community-view .comind { height:100%; min-height:0; }
+@media (max-width: 850px) {
+  .app-topbar { gap:12px; padding:0 12px; }
+  .workspace-navigation { overflow-x:auto; }
+  .workspace-nav-item { padding:0 9px; font-size:11px; }
+  .workspace-user>span:last-child { display:none; }
+}
+@media (max-width: 540px) {
+  .app-topbar { height:58px; min-height:58px; }
+  .workspace-brand>span:last-child { display:none; }
+  .workspace-navigation { gap:0; }
+  .workspace-nav-item { padding:0 7px; font-size:10px; }
+}
